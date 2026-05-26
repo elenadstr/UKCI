@@ -1,0 +1,7 @@
+config/config.yaml
+data/
+outputs/*.csv
+outputs/*.png
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
