@@ -14,21 +14,6 @@ The repository contains the  modules:
 - **`EventCoincidenceAnalysis`** — test whether the temporal clustering of
   extreme events exceeds random chance, using Event Coincidence Analysis (ECA) following Donges et al. (2016).
 
-## Quickstart
-
-```python
-from threshold_detector import flag_extreme_events, detect_compound_events, run_eca
-
-# 1. Detect extremes
-binary = flag_extreme_events(my_data, threshold=20, direction='above')
-
-# 2. Find compound episodes
-events = detect_compound_events(binary, delT=4, min_duration=2)
-
-# 3. Test clustering
-result = run_eca(binary, binary, delT=4, tau=1)
-print(result.summary_table())
-```
 
 ## Setup
 
