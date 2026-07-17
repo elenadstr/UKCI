@@ -5,8 +5,7 @@ following methodology in Dauster et al.(XXXX).
 ## what this module does
 Given a regional variable for extreme at a regular time step (here we use daily maximum rainfall data from the CPM), it
 
-1. Detects extreme precipitation events using either a fixed impact threshold 
-   (20 mm/hr) or a thermodynamically-adjusted percentile-based threshold
+1. Detects extreme precipitation events using either a fixed impact threshold (20 mm/hr) or a thermodynamically-adjusted percentile-based threshold
 2. Applies ECA to test whether temporal clustering of extreme events exceeds random chance
 3. Produces the two main diagnostic figures from the paper:
    - A 4-panel Wales case study (single member, both thresholds, fixed and ensemble)
@@ -22,9 +21,9 @@ Then edit `config.yaml` with:
 - paths to your NetCDF rainfall data (one file per ensemble member per region)
 - path to the regional GeoJSON mask
 - output directory for figures and CSVs
-- path to the R script `CoinCalc.R`, copied from: https://github.com/JonatanSiegmund/CoinCalc
+- the parametres for the analsis (thresholds, date range ...)
 
-Expected NetCDF filename convention: `p110{ensemble}_{region_code}.nc`  
+Expected NetCDF filename convention: `p110{ensemble}_{region_code}.nc`
 Example: `p1100000_Wales.nc`
 
 ## runnig the notebook

@@ -1,0 +1,16 @@
+data:
+  base_dir: "/path/to/your/netcdf/data"
+  geojson_path: "/path/to/your/regional/mask.geojson"
+
+output:
+  summary_csv: "/path/to/outputs/summary_ECA_results.csv"
+  figures_dir: "/path/to/outputs/figures"
+
+analysis:
+  wet_threshold: 20
+  lower_month: 6
+  higher_month: 9
+  delT: 4
+  tau: 1
+  len_wet: 1
+  meteo_window: 4

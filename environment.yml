@@ -1,0 +1,20 @@
+name: ukci
+channels:
+  - conda-forge
+
+dependencies:
+  - python >=3.12,<3.13
+  - numpy
+  - scipy
+  - pandas
+  - matplotlib
+  - iris
+  - geopandas
+  - cartopy
+  - jupyter
+  - ipykernel
+
+  # pip-only packages (not on conda-forge)
+  - pip
+  - pip:
+    - event-analysis    # the PyPI ECA package: https://pypi.org/project/event-analysis/

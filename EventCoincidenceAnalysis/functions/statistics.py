@@ -1,3 +1,8 @@
+import numpy as np
+import math
+import iris
+from iris.time import PartialDateTime
+
 ''' Binomial distribution of trigger coincidences (Kt)'''
 def binomial_Kt(seriesA, seriesB, KT, delT=4, tau =0):
     TOL = delT + 1

@@ -1,7 +1,16 @@
+# top secrets and local config
 config/config.yaml
-data/
-outputs/*.csv
-outputs/*.png
+
+# python cache
 __pycache__/
 *.pyc
+*.pyo
 .ipynb_checkpoints/
+
+#outputs — generated files, not source
+outputs/figures/*.png
+outputs/*.csv
+
+#common editor/OS noise
+.DS_Store
+*.swp

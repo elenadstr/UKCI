@@ -1,3 +1,6 @@
+import numpy as np
+from scipy import stats
+
 ''' percentuile and corresponding value code '''
 def get_percentile(value, precipitation_cube):
     precip_data = precipitation_cube.data.flatten()

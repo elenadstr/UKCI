@@ -1,3 +1,6 @@
+import numpy as np
+
+
 def flag_wet_events(timeseries, N, wet_threshold):
     '''
     flags wet events in a timeseries.
