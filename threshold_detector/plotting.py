@@ -6,6 +6,7 @@ plotting functions for extreme event detection and ECA results.
 
 import numpy as np
 import pandas as pd
+import matplotlib as mpl
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 
@@ -77,116 +78,157 @@ def plot_event_timeseries(compound_dates, single_dates=None, rolling_window=10, 
 
 
 
-def plot_ensemble_hovmoller(events_df, ensemble_col='ensemble', year_col='year', count_col=None, extreme_days_col=None, cmap='Blues', figsize=(14, 5)):
+def plot_ensemble_hovmoller(events_df, ensemble_col='ensemble',
+                            year_col='year', count_col=None,
+                            duration_col='n_extreme_days',
+                            length_col='length',
+                            cmap='Blues', figsize=(14, 5)):
     """
-    Plot Hovmöller-style heatmaps of ensemble spread over time.
+    Hovmoller-style heatmaps (ensemble member x year) of the compound-event
+    record.
 
-    Produces TWO separate figures:
-      1. Number of events per ensemble per year
-      2. Number of extreme days per ensemble per year (if extreme_days_col given)
+    Produces up to FIVE figures, returned as a dict:
+
+    - ``'events'``        : number of events per member per year
+    - ``'days'``          : total extreme days per member per year
+    - ``'max_duration'``  : the maximum total duration (extreme days) of any
+                            single event, per member per year
+    - ``'mean_duration'`` : mean event duration (extreme days) per member
+                            per year
+    - ``'mean_length'``   : mean event length (span in days, end - start + 1)
+                            per member per year
+
+    The duration panels need ``duration_col`` and the length panel needs
+    ``length_col``; pass ``None`` to skip (the corresponding dict entry is
+    then absent).
 
     Parameters
     ----------
     events_df : pd.DataFrame
         One row per event. Must contain ensemble_col and year_col.
-    ensemble_col : str
-        Column name for ensemble member ID. Default 'ensemble'.
-    year_col : str
-        Column name for year. Default 'year'.
+    ensemble_col, year_col : str
+        Column names. Defaults 'ensemble', 'year'.
     count_col : str, optional
-        If provided, use this column to sum values rather than counting rows.
-        Useful if events_df is already aggregated.
-    extreme_days_col : str, optional
-        Column containing the number of extreme days in each event (e.g. 'n_extreme_days').
-        If provided, a second figure is produced showing total extreme days per year.
+        If provided, the 'events' panel sums this column instead of counting
+        rows (for pre-aggregated inputs).
+    duration_col : str or None, optional
+        Column with each event's total duration in extreme days. Default
+        'n_extreme_days'.
+    length_col : str or None, optional
+        Column with each event's length (span). Default 'length'.
     cmap : str, optional
-        Matplotlib colormap name. Default 'Blues'.
     figsize : tuple, optional
-        Size of each individual figure. Default (14, 5).
 
     Returns
-    fig_events : Figure
-        Number of events per ensemble per year.
-    fig_days : Figure or None
-        Number of extreme days per ensemble per year. None if extreme_days_col mnot provided.
+    -------
+    dict of {name: matplotlib Figure}
     """
     ensembles = sorted(events_df[ensemble_col].unique())
     all_years = sorted(events_df[year_col].unique())
     n_ens = len(ensembles)
     n_years = len(all_years)
     ens_to_idx = {e: i for i, e in enumerate(ensembles)}
-    yr_to_idx  = {y: i for i, y in enumerate(all_years)}
+    yr_to_idx = {y: i for i, y in enumerate(all_years)}
 
-    # count matrix (number of events)
     event_matrix = np.zeros((n_ens, n_years))
+    days_matrix = np.zeros((n_ens, n_years))
+    max_dur_matrix = np.zeros((n_ens, n_years))
+    dur_sum = np.zeros((n_ens, n_years))
+    len_sum = np.zeros((n_ens, n_years))
+    n_events = np.zeros((n_ens, n_years))
+
     for _, row in events_df.iterrows():
         ei = ens_to_idx.get(row[ensemble_col])
         yi = yr_to_idx.get(row[year_col])
-        if ei is not None and yi is not None:
-            event_matrix[ei, yi] += 1 if count_col is None else row[count_col]
+        if ei is None or yi is None:
+            continue
+        event_matrix[ei, yi] += 1 if count_col is None else row[count_col]
+        n_events[ei, yi] += 1
+        if duration_col is not None:
+            d = row[duration_col]
+            days_matrix[ei, yi] += d
+            max_dur_matrix[ei, yi] = max(max_dur_matrix[ei, yi], d)
+            dur_sum[ei, yi] += d
+        if length_col is not None:
+            len_sum[ei, yi] += row[length_col]
 
-    #order ensembles by total event count (ascending)
-    total_counts = event_matrix.sum(axis=1)
-    sort_order = np.argsort(total_counts)
-    event_matrix = event_matrix[sort_order]
-    sorted_ensemble_labels = [ensembles[i] for i in sort_order]
+    # order members by total event count (ascending), shared by all panels
+    sort_order = np.argsort(event_matrix.sum(axis=1))
+    labels = [ensembles[i] for i in sort_order]
 
-    def _make_hovmoller(matrix, labels, ylabel_text, heading, sub_heading, figsize, cmap):
+    def _make(matrix, heading, sub_heading, cbar_label):
         fig, ax = plt.subplots(figsize=figsize)
-        c = ax.pcolormesh(all_years, np.arange(n_ens), matrix, shading='nearest', cmap=cmap)
+        c = ax.pcolormesh(all_years, np.arange(n_ens), matrix[sort_order],
+                          shading='nearest', cmap=cmap)
         ax.set_xticks([y for y in all_years if y % 10 == 0])
         ax.set_yticks(np.arange(n_ens))
         ax.set_yticklabels(labels)
         ax.set_xlabel('Year')
-        ax.set_ylabel(ylabel_text)
-        fig.colorbar(c, ax=ax, label='Count')
+        ax.set_ylabel('Ensemble member')
+        fig.colorbar(c, ax=ax, label=cbar_label)
         _add_ipcc_title(fig, heading, sub_heading)
         return fig
 
-    fig_events = _make_hovmoller(
-        event_matrix, sorted_ensemble_labels, 'Ensemble member',
-        'Ensemble-year Hovmöller diagram of event frequency',
-        'Number of extreme events per year for each ensemble member, ordered by total event count. Colour intensity indicates higher event frequency.',
-        figsize, cmap
-    )
+    figs = {'events': _make(
+        event_matrix,
+        'Ensemble-year Hovmoller diagram of event frequency',
+        'Number of compound events per year for each ensemble member, '
+        'ordered by total event count.', 'Events')}
 
-    fig_days = None
-    if extreme_days_col is not None:
-        days_matrix = np.zeros((n_ens, n_years))
-        for _, row in events_df.iterrows():
-            ei = ens_to_idx.get(row[ensemble_col])
-            yi = yr_to_idx.get(row[year_col])
-            if ei is not None and yi is not None:
-                days_matrix[ei, yi] += row[extreme_days_col]
-        days_matrix = days_matrix[sort_order]  # same sort order as event matrix
+    if duration_col is not None:
+        with np.errstate(invalid='ignore'):
+            mean_dur = np.where(n_events > 0, dur_sum / n_events, 0.0)
+        figs['days'] = _make(
+            days_matrix,
+            'Ensemble-year Hovmoller diagram of extreme day totals',
+            'Total number of extreme days in compound events per year for '
+            'each ensemble member.', 'Extreme days')
+        figs['max_duration'] = _make(
+            max_dur_matrix,
+            'Ensemble-year Hovmoller diagram of maximum event duration',
+            'Maximum total duration (extreme days) of any single compound '
+            'event in each year, per ensemble member.', 'Max duration (days)')
+        figs['mean_duration'] = _make(
+            mean_dur,
+            'Ensemble-year Hovmoller diagram of mean event duration',
+            'Mean duration (extreme days per event) of compound events in '
+            'each year, per ensemble member.', 'Mean duration (days)')
 
-        fig_days = _make_hovmoller(
-            days_matrix, sorted_ensemble_labels, 'Ensemble member',
-            'Ensemble-year Hovmöller diagram of extreme day totals',
-            'Total number of extreme days per year for each ensemble member, ordered by total event count. Colour intensity indicates a greater number of extreme days.',
-            figsize, cmap
-        )
+    if length_col is not None:
+        with np.errstate(invalid='ignore'):
+            mean_len = np.where(n_events > 0, len_sum / n_events, 0.0)
+        figs['mean_length'] = _make(
+            mean_len,
+            'Ensemble-year Hovmoller diagram of mean event length',
+            'Mean length (span in days, end - start + 1) of compound events '
+            'in each year, per ensemble member.', 'Mean length (days)')
 
-    return fig_events, fig_days
+    return figs
 
-def plot_ensemble_spread(summary_df, rolling_window=10,
-                         line_colour='darkblue', band_colour='cornflowerblue',
-                         title=None, figsize=(12, 5)):
+def plot_ensemble_spread(events_by_member, rolling_window=10,
+                         mean_colour='black', cmap='tab20',
+                         year_range=None, title=None, figsize=(13, 5.5)):
     """
-    plolt the ensemble mean compound event count per year with a shaded
-    min–max band showing the projection range.
+    Plot every ensemble member as its own coloured line of annual compound
+    event counts, with the ensemble mean overlaid in a distinct colour.
 
     Parameters
     ----------
-    summary_df : pd.DataFrame
-        Output of summarise_ensemble_events — needs columns
-        year, mean, min, max.
+    events_by_member : dict
+        {ensemble_id: events DataFrame with a 'year' column}, as built in
+        the demo notebook. (For backwards convenience a summary DataFrame
+        from summarise_ensemble_events is NOT accepted -- per-member counts
+        are needed to draw the member lines.)
     rolling_window : int, optional
-        Years for the rolling mean of the central line. Default 10.
-    line_colour : str, optional
-        Colour of the ensemble mean line.
-    band_colour : str, optional
-        Colour of the min–max shaded band.
+        Years for the rolling mean applied to every line. Default 10.
+        Set to 1 for raw annual counts.
+    mean_colour : str, optional
+        Colour of the ensemble-mean line (distinct from the members).
+    cmap : str, optional
+        Qualitative colormap cycled across members. Default 'tab20'.
+    year_range : (int, int), optional
+        Inclusive year axis; default spans the years present in the data.
+        Years with no events count as 0 (important for the mean).
     title : str, optional
     figsize : tuple, optional
 
@@ -196,30 +238,47 @@ def plot_ensemble_spread(summary_df, rolling_window=10,
     """
     import matplotlib.pyplot as plt
 
-    s = summary_df.sort_values('year')
-    mean_rolling = s['mean'].rolling(window=rolling_window, center=True).mean()
+    members = sorted(events_by_member)
+    if not members:
+        raise ValueError("events_by_member is empty")
+    all_years = pd.concat(
+        [df['year'] for df in events_by_member.values() if len(df) > 0])
+    if year_range is None:
+        year_range = (int(all_years.min()), int(all_years.max()))
+    years = np.arange(year_range[0], year_range[1] + 1)
 
+    counts = pd.DataFrame(index=years)
+    for ens in members:
+        df = events_by_member[ens]
+        c = df.groupby('year').size() if len(df) else pd.Series(dtype=float)
+        counts[ens] = c.reindex(years).fillna(0)
+
+    smoothed = counts.rolling(window=rolling_window, center=True,
+                              min_periods=1).mean()
+    mean_line = smoothed.mean(axis=1)
+
+    colours = mpl.colormaps[cmap](np.linspace(0, 1, len(members)))
     fig, ax = plt.subplots(figsize=figsize)
-    ax.fill_between(s['year'], s['min'], s['max'],
-                    color=band_colour, alpha=0.4,
-                    label='Ensemble range (min–max)')
-    ax.plot(s['year'], s['mean'], color=line_colour, alpha=0.3, lw=1,
-            label='Ensemble mean (annual)')
-    ax.plot(s['year'], mean_rolling, color=line_colour, lw=2.5,
-            label=f'Ensemble mean ({rolling_window}-yr)')
+    for colour, ens in zip(colours, members):
+        ax.plot(years, smoothed[ens], color=colour, lw=1.2, alpha=0.85,
+                label=ens)
+    ax.plot(years, mean_line, color=mean_colour, lw=3.0, zorder=5,
+            label='Ensemble mean')
 
     ax.set_xlabel('Year')
     ax.set_ylabel('Compound events per year')
-    ax.legend()
+    ax.legend(title='Member', ncols=2, fontsize=8, loc='center left',
+              bbox_to_anchor=(1.01, 0.5))
     _add_ipcc_title(
         fig,
         heading=title or 'Ensemble projection of annual compound event frequency',
         sub_heading=(
-            f'Ensemble mean compound event count per year with a {rolling_window}-year rolling '
-            f'mean (solid line) and a shaded band spanning the full ensemble range '
-            f'(minimum to maximum across members).'
+            f'Each coloured line is one ensemble member '
+            f'({rolling_window}-year rolling mean of annual compound event '
+            f'counts); the thick {mean_colour} line is the ensemble mean.'
         )
     )
+    fig.tight_layout()
     return fig
 
 def plot_duration_and_counts(events_df, ensemble_col='ensemble', year_col='year', length_col='length', year_range=(1979, 2079), cmap='YlGnBu_r', figsize=(16, 10)):
@@ -302,3 +361,29 @@ def plot_duration_and_counts(events_df, ensemble_col='ensemble', year_col='year'
         rect_top=0.85
     )
     return fig
+
+def save_figure(fig, path, dpi=150, **savefig_kwargs):
+    """Save a figure, creating the output directory first if it does not
+    exist.
+
+    Parameters
+    ----------
+    fig : matplotlib Figure
+    path : str -- output file path; parent directories are created with
+        ``os.makedirs(..., exist_ok=True)``.
+    dpi : int, optional
+    **savefig_kwargs : forwarded to ``fig.savefig`` (``bbox_inches='tight'``
+        is applied unless overridden).
+
+    Returns
+    -------
+    str -- the path written.
+    """
+    import os
+
+    out_dir = os.path.dirname(path)
+    if out_dir and not os.path.isdir(out_dir):
+        os.makedirs(out_dir, exist_ok=True)
+    savefig_kwargs.setdefault('bbox_inches', 'tight')
+    fig.savefig(path, dpi=dpi, **savefig_kwargs)
+    return path

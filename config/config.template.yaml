@@ -7,10 +7,13 @@ output:
   figures_dir: "/path/to/outputs/figures"
 
 analysis:
-  wet_threshold: 20
-  lower_month: 6
+  wet_threshold: 20      # mm/hr impact threshold (paper Section 2.1) -- david you need to change this for you analysis 
+                      #cause you have a more options
+  lower_month: 6         # JJAS
   higher_month: 9
-  delT: 4
-  tau: 1
-  len_wet: 1
-  meteo_window: 4
+  delT: 4                # ECA coincidence window; max linkage gap = tau + delT
+  tau: 1                 # ECA minimum lag
+  len_wet: 1             # consecutive days required per extreme event
+  min_duration: 2        # extreme days required per compound event
+  null_model: "pooled"   # "pooled" = paper Eq. (1); "blocked" = exact
+                         # per-season Poisson-binomial (advanced toggle)

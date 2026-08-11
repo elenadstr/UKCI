@@ -1,103 +1,260 @@
 """
 threshold_detector/detector.py
 
-functions for detecting extreme events in a timeseries.
-Works for any variable and any threshold direction (above or below).
+User-facing detection layer for UKCI. Flexible extreme-event flagging for any
+variable/threshold direction, plus compound-event identification consistent
+with the paper's counting method.
+
+All counting maths delegates to the vendored engine in :mod:`eca_analysis`
+(see ``eca_analysis/VENDORED.md``); this module adds convenience and the
+UKCI extensions (percentile thresholds, tolerant N-day events, two-variable
+sequential / co-occurring modes).
+
+Event criteria: per variable, then compound
+-------------------------------------------
+Each variable gets its own definition of "an extreme event" at the flagging
+stage (:func:`flag_extreme_events`): threshold, direction, ``N`` consecutive
+days, and optionally ``min_days`` (a tolerance: at least ``min_days`` of the
+``N`` days extreme, e.g. a 20-day drought with >= 19 dry days). The compound
+stage then links flagged events with the paper's rule and applies a minimum
+number of flagged days per variable within one event
+(``min_duration`` for single-variable; ``min_duration_1`` /
+``min_duration_2`` for the two-variable modes).
+
+Compound-event linkage (paper, Section 2.1)
+-------------------------------------------
+Two flagged days link iff their gap ``g`` satisfies
+``tau <= g <= tau + delT`` AND both days lie in the same (year, season)
+block. With the paper defaults ``tau=1, delT=4`` the maximum linkage gap is
+therefore **5 days** (the paper's "four-day window" refers to ``delT``; the
+coincidence window has length ``delT + 1``, Eq. 1's ``TOL``). No window
+ever spans a season boundary.
+
+Seasons (modular)
+-----------------
+A season is ``(season_start, season_length)``: the start month and how many
+months it lasts, wrapping the calendar year if needed. ``(6, 4)`` is
+June-September (JJAS, the default); ``(8, 2)`` is August-September;
+``(10, 5)`` is October-February, wrapping into the next calendar year. For
+wrapped seasons the season-year label is the START year: October 1980 -
+February 1981 is season-year 1980 (see :func:`season_year_labels`).
 """
+
+from __future__ import annotations
 
 import numpy as np
 
-def load_region_ensemble(base_dir, region, ensembles,
-                         lower_month=6, higher_month=9,
-                         filename_pattern="p110{ensemble}_{region}.nc"):
-    """
-    Load a variable for all ensemble members of one region.
+from eca_analysis import compound_episodes
 
-    Builds paths of the form {base_dir}/{region}/{filename_pattern} and loads
-    each into a numpy array, extracting a chosen month range.
+
+# --------------------------------------------------------------------------- #
+# defensive validation
+# --------------------------------------------------------------------------- #
+def _check_int(name, value, minimum):
+    if not (np.isscalar(value) and float(value) == int(value)):
+        raise ValueError(f"{name} must be an integer, got {value!r}")
+    value = int(value)
+    if value < minimum:
+        raise ValueError(f"{name} must be >= {minimum}, got {value}")
+    return value
+
+
+def _check_linkage(delT, tau):
+    delT = _check_int("delT", delT, 0)
+    tau = _check_int("tau", tau, 1)   # tau >= 1: a day never coincides with
+    return delT, tau                  # itself; max linkage gap = tau + delT
+
+
+def _check_binary(name, series):
+    series = np.asarray(series)
+    if series.ndim != 1:
+        raise ValueError(f"{name} must be 1-D, got shape {series.shape}")
+    bad = ~np.isin(series, (0, 1))
+    if bad.any():
+        raise ValueError(f"{name} must be binary (0/1); found "
+                         f"{np.unique(series[bad])[:5]} at e.g. index "
+                         f"{int(np.flatnonzero(bad)[0])}")
+    return series.astype(int)
+
+
+def _check_season(season_start, season_length):
+    season_start = _check_int("season_start", season_start, 1)
+    if season_start > 12:
+        raise ValueError(f"season_start must be 1-12, got {season_start}")
+    season_length = _check_int("season_length", season_length, 1)
+    if season_length > 12:
+        raise ValueError(f"season_length must be 1-12, got {season_length}")
+    return season_start, season_length
+
+
+# --------------------------------------------------------------------------- #
+# modular seasons
+# --------------------------------------------------------------------------- #
+def season_months(season_start, season_length):
+    """Months of a modular season: start month + duration, wrapping the year.
+
+    >>> season_months(8, 2)   # August -> September
+    (8, 9)
+    >>> season_months(10, 5)  # October -> February (wraps)
+    (10, 11, 12, 1, 2)
+    """
+    season_start, season_length = _check_season(season_start, season_length)
+    return tuple((season_start - 1 + k) % 12 + 1 for k in range(season_length))
+
+
+def season_year_labels(years, months, season_start):
+    """Season-year label per step: the calendar year the season STARTED in.
+
+    For non-wrapping seasons this equals the calendar year. For wrapping
+    seasons, months before ``season_start`` belong to the season that began
+    the previous calendar year: with ``season_start=10``, Oct-Dec 1980 and
+    Jan-Feb 1981 all get label 1980 -- so every season-year is one contiguous
+    block and the labels cover all valid years.
+    """
+    years = np.asarray(years, dtype=int)
+    months = np.asarray(months, dtype=int)
+    if years.shape != months.shape:
+        raise ValueError("years and months must have the same shape")
+    return np.where(months >= season_start, years, years - 1)
+
+
+def make_season_blocks(years=None, months=None, season_start=6,
+                       season_length=4, n_steps=None):
+    """Build per-season index blocks for a daily series.
 
     Parameters
     ----------
-    base_dir : str
-        Root directory containing per-region subfolders.
-    region : str
-        Region name, e.g. 'Wales' — used for both subfolder and filename.
-    ensembles : list of str
-        Ensemble member IDs, e.g. ['0000', '1113', ...].
-    lower_month, higher_month : int, optional
-        Inclusive month range to extract. Default 6–9 (June–September).
-    filename_pattern : str, optional
-        Filename template with {ensemble} and {region} placeholders.
+    years : array-like of int, aligned to the series. Required unless the
+        series is a single contiguous block (then pass ``n_steps`` instead).
+    months : array-like of int, optional. If omitted, the series is assumed
+        already season-extracted with non-wrapping seasons, and blocks are
+        the runs of equal ``years`` values. REQUIRED for wrapping seasons
+        (``season_start + season_length > 13``), where calendar years alone
+        cannot identify the season boundaries.
+    season_start, season_length : the modular season spec (default JJAS).
+    n_steps : series length, only for the ``years=None`` single-block case.
 
     Returns
     -------
-    dict
-        {ensemble_id: numpy array of daily values}. Members that fail to
-        load are skipped with a printed warning rather than raising.
-
-    Examples
-    --------
-    >>> data = load_region_ensemble(BASE_DIR, 'Wales', ENSEMBLES)
-    >>> data['0000'].shape
-    (3050,)
+    list of np.ndarray -- index arrays, one per season-year, chronological.
+    Steps whose month is outside the season are in no block (and therefore
+    can never be part of an event).
     """
-    import os
-    import iris
-    from iris.time import PartialDateTime
+    season_start, season_length = _check_season(season_start, season_length)
+    if years is None:
+        if n_steps is None:
+            raise ValueError("pass years=..., or n_steps=... for a single "
+                             "contiguous block")
+        return [np.arange(_check_int("n_steps", n_steps, 1))]
+    years = np.asarray(years, dtype=int)
+    wraps = season_start + season_length > 13
+    if months is None:
+        if wraps:
+            raise ValueError(
+                f"season ({season_start}, {season_length}) wraps the "
+                "calendar year, so months= is required to build blocks -- "
+                "consecutive calendar years alone cannot mark where one "
+                "season ends and the next begins.")
+        labels = years
+        in_season = np.ones(len(years), dtype=bool)
+    else:
+        months = np.asarray(months, dtype=int)
+        if months.shape != years.shape:
+            raise ValueError("years and months must have the same shape")
+        in_season = np.isin(months, season_months(season_start,
+                                                  season_length))
+        labels = season_year_labels(years, months, season_start)
+    blocks = []
+    for lab in np.unique(labels[in_season]):
+        blocks.append(np.flatnonzero((labels == lab) & in_season))
+    return blocks
 
-    member_data = {}
-    month_range = iris.Constraint(
-        time=lambda cell: PartialDateTime(month=lower_month) <= cell.point<= PartialDateTime(month=higher_month))
 
-    for ensemble in ensembles:
-        path = os.path.join(base_dir, region,filename_pattern.format(ensemble=ensemble, region=region))
-        try:
-            cube = iris.load(path)[0]
-            cube = cube.extract(month_range)
-            member_data[ensemble] = cube.data
-        except Exception as e:
-            print(f"  Warning: could not load ensemble {ensemble} for {region}: {e}")
+def _resolve_blocks(n_steps, blocks, years, months, season_start,
+                    season_length, func_name):
+    """Shared block resolution; refuses to silently run unblocked."""
+    if blocks is None and years is None:
+        raise ValueError(
+            f"{func_name} needs season blocks so that events cannot pair "
+            "across a season boundary (e.g. September -> next June). Pass "
+            "blocks=..., or years= (and months= if the series is not already "
+            "season-extracted, or if the season wraps the calendar year). "
+            "For a genuinely contiguous single-block series, pass "
+            "blocks='contiguous' explicitly.")
+    if isinstance(blocks, str):
+        if blocks == "contiguous":
+            return [np.arange(n_steps)]
+        raise ValueError(f"unknown blocks={blocks!r}")
+    if blocks is not None:
+        return [np.asarray(b, dtype=int) for b in blocks]
+    return make_season_blocks(years, months, season_start, season_length)
 
-    return member_data
 
-def flag_extreme_events(timeseries, threshold, N=1, direction='above', flag='all'):
-    '''
-    Flag extreme events in a timeseries.
+# --------------------------------------------------------------------------- #
+# extreme-event flagging (per-variable event criteria)
+# --------------------------------------------------------------------------- #
+def flag_extreme_events(timeseries, threshold, N=1, min_days=None,
+                        direction='above', flag='last'):
+    """Flag extreme events in a timeseries.
 
-    An event is flagged when N consecutive values are on the extreme side of the threshold.
-      The flag position is determined by the 'flag' parameter.
+    An event is flagged when, within a window of ``N`` consecutive days, at
+    least ``min_days`` of them are on the extreme side of ``threshold``
+    (strict inequality). ``min_days`` defaults to ``N`` (all days required,
+    the strict spell); setting ``min_days < N`` tolerates interruptions --
+    e.g. ``N=20, min_days=19`` is "a 20-day drought with at least 19 dry
+    days".
 
-    Parameters:
+    Parameters
+    ----------
     timeseries : array-like
         Input timeseries of any climate variable.
     threshold : float
-        The threshold value that defines an extreme.
+        Threshold defining an extreme.
     N : int, optional
-        Number of consecutive days that must exceed the threshold to constitute an event. Default is 1 (any single exceedance).
-    direction : str, optional
-        'above' flags values greater than threshold (e.g. heavy rain, heat).
-        'below' flags values less than threshold (e.g. drought, cold).
-        Default is 'above'.
-    flag : str, optional
-        Which days in the consecutive window to flag.
-        'last' flags only the last day of the window.
-        'first' flags only the first day of the window.
-        'all' flags all days in the window (default).
+        Window length in days. Default 1.
+    min_days : int, optional
+        Minimum extreme days within the N-day window. Default: ``N``
+        (uninterrupted spell). Must satisfy ``1 <= min_days <= N``.
+    direction : {'above', 'below'}, optional
+        'above' flags values > threshold (heavy rain, heat);
+        'below' flags values < threshold (drought, cold). Default 'above'.
+    flag : {'last', 'first', 'all'}, optional
+        Which day(s) of each qualifying window to flag. Default ``'last'``
+        (the day the event completes) -- with ``min_days == N`` this matches
+        the paper engine's ``flag_wet_events`` exactly for every N (enforced
+        in tests). Note ``'last'``/``'first'`` mark the window edge, which
+        with ``min_days < N`` may itself be a non-extreme day. ``'all'``
+        marks only the extreme days inside the window.
+
+        The scan jumps past each qualifying window (``i += N``): overlapping
+        qualifying windows are not re-flagged, so one long spell yields one
+        flag per N days, matching the engine's event counting.
 
     Returns
+    -------
     numpy.ndarray
-        Binary array of same length as timeseries. 1 = extreme event, 0 = not.
-    '''
+        Binary array, 1 = extreme event, 0 = not.
+    """
+    timeseries = np.asarray(timeseries, dtype=float)
+    if timeseries.ndim != 1:
+        raise ValueError(f"timeseries must be 1-D, got shape "
+                         f"{timeseries.shape}")
+    if not np.isscalar(threshold):
+        raise ValueError(f"threshold must be a number, got {threshold!r}")
+    N = _check_int("N", N, 1)
+    min_days = N if min_days is None else _check_int("min_days", min_days, 1)
+    if min_days > N:
+        raise ValueError(f"min_days ({min_days}) cannot exceed N ({N})")
+    if direction not in ('above', 'below'):
+        raise ValueError(f"direction must be 'above' or 'below', got "
+                         f"'{direction}'")
+    if flag not in ('last', 'first', 'all'):
+        raise ValueError(f"flag must be 'last', 'first' or 'all', got "
+                         f"'{flag}'")
 
-    timeseries = np.array(timeseries, dtype=float)
+    exceeds = (timeseries > threshold) if direction == 'above' \
+        else (timeseries < threshold)
     events = np.zeros(len(timeseries), dtype=int)
-
-    if direction == 'above':
-        exceeds = timeseries > threshold
-    elif direction == 'below':
-        exceeds = timeseries < threshold
-    else:
-        raise ValueError(f"direction must be 'above' or 'below', got '{direction}'")
 
     if N == 1:
         events[exceeds] = 1
@@ -106,26 +263,354 @@ def flag_extreme_events(timeseries, threshold, N=1, direction='above', flag='all
     i = 0
     while i <= len(timeseries) - N:
         window = exceeds[i:i + N]
-        if np.all(window):
+        if int(window.sum()) >= min_days:
             if flag == 'last':
                 events[i + N - 1] = 1
             elif flag == 'first':
                 events[i] = 1
-            elif flag == 'all':
-                events[i:i + N] = 1
-            else:
-                raise ValueError(f"flag must be 'all', 'first', or 'last', got '{flag}'")
+            else:  # 'all': mark the extreme days inside the window
+                events[i:i + N][window] = 1
             i += N
         else:
             i += 1
-
     return events
 
 
-def summarise_ensemble_events(events_by_member):
+def flag_extreme_events_percentile(timeseries, percentile, N=1, min_days=None,
+                                   direction='above', flag='last',
+                                   reference=None):
+    """Flag extremes using a percentile threshold rather than a fixed value.
+
+    For the paper's thermodynamic adjustment (Section 2.3): compute the
+    percentile rank of the impact threshold in the *baseline* window, then
+    call this once per rolling window with ``reference=that_window`` -- or
+    use :func:`thermodynamic_thresholds` which does the loop for you.
+
+    Parameters as :func:`flag_extreme_events`, plus:
+
+    percentile : float
+        Percentile (0-100) used as the threshold.
+    reference : array-like, optional
+        Data the percentile is computed from. Default: the timeseries itself.
+
+    Returns
+    -------
+    (numpy.ndarray, float)
+        Binary event array and the threshold value applied.
     """
-    Collapse per-member compound event DataFrames into an ensemble summary,
-    giving the spread (range of projections) across members.
+    if not np.isscalar(percentile) or not 0 <= percentile <= 100:
+        raise ValueError(f"percentile must be in [0, 100], got {percentile!r}")
+    timeseries = np.asarray(timeseries, dtype=float)
+    ref = np.asarray(reference, dtype=float) if reference is not None \
+        else timeseries
+    threshold = float(np.percentile(ref, percentile))
+    binary = flag_extreme_events(timeseries, threshold, N=N,
+                                 min_days=min_days, direction=direction,
+                                 flag=flag)
+    return binary, threshold
+
+
+def thermodynamic_thresholds(data_by_window, baseline_key, fixed_threshold):
+    """Per-window thresholds matching the baseline percentile of a fixed
+    impact threshold (paper Section 2.3; mirrors
+    ``eca_analysis.compound_eca_windows.analyse_region``).
+
+    Parameters
+    ----------
+    data_by_window : dict[label -> array-like]
+        Raw (not binarised) data per rolling window.
+    baseline_key : label of the baseline window (e.g. '1980-2010').
+    fixed_threshold : float, the impact threshold (e.g. 20 mm/hr).
+
+    Returns
+    -------
+    dict[label -> float] -- the adjusted threshold per window. The baseline
+    window's value equals ``fixed_threshold`` up to percentile inversion.
+    """
+    from eca_analysis import get_percentile, value_from_percentile
+    if baseline_key not in data_by_window:
+        raise ValueError(f"baseline_key {baseline_key!r} not in "
+                         f"data_by_window keys {list(data_by_window)}")
+    base_pct = get_percentile(fixed_threshold, data_by_window[baseline_key])
+    return {lbl: value_from_percentile(base_pct, d)
+            for lbl, d in data_by_window.items()}
+
+
+# --------------------------------------------------------------------------- #
+# compound-event identification
+# --------------------------------------------------------------------------- #
+def detect_compound_events(binary_series, delT=4, tau=1, min_duration=2,
+                           blocks=None, years=None, months=None,
+                           season_start=6, season_length=4):
+    """Single-variable mode: sequential extremes of ONE variable (the
+    paper's method, Section 2.1).
+
+    Flagged days link iff their gap ``g`` satisfies ``tau <= g <= tau +
+    delT`` (max gap ``tau + delT`` days -- **5** with the defaults) within
+    the same season block; compound events are the connected components with
+    at least ``min_duration`` flagged days.
+
+    Implemented on :func:`eca_analysis.compound_episodes`, so the events
+    returned here are exactly the episodes implied by the self-ECA
+    coincidence indices -- the counting and the significance test can never
+    disagree.
+
+    Parameters
+    ----------
+    binary_series : array-like
+        Binary timeseries from :func:`flag_extreme_events`.
+    delT : int, optional
+        ECA coincidence window (paper default 4).
+    tau : int, optional
+        ECA minimum lag, must be >= 1 (paper default 1). Max linkage gap =
+        ``tau + delT``.
+    min_duration : int, optional
+        Minimum number of flagged days per event. Default 2 (single days
+        excluded).
+    blocks : list of index arrays, or 'contiguous', optional
+        Season blocks. Events never link across block boundaries.
+    years, months : array-like, optional
+        Alternative to ``blocks``: per-step year (and month); blocks are
+        built with :func:`make_season_blocks`. ``months`` is required if the
+        series is not already season-extracted or if the season wraps the
+        calendar year.
+    season_start, season_length : int, optional
+        Modular season spec (default 6, 4 = JJAS). ``(10, 5)`` = Oct-Feb.
+
+    One of ``blocks`` / ``years`` is REQUIRED -- running unblocked on a
+    season-extracted series silently links the last month of one season to
+    the first month of the next, which the counting method forbids.
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns: start_idx, end_idx, length, n_extreme_days; one row per
+        event. ``length = end_idx - start_idx + 1`` (span in steps),
+        ``n_extreme_days`` is the paper's "duration".
+    """
+    import pandas as pd
+
+    binary_series = _check_binary("binary_series", binary_series)
+    delT, tau = _check_linkage(delT, tau)
+    min_duration = _check_int("min_duration", min_duration, 1)
+    blks = _resolve_blocks(len(binary_series), blocks, years, months,
+                           season_start, season_length,
+                           "detect_compound_events")
+    episodes = compound_episodes(binary_series, blks, delT=delT, tau=tau)
+    rows = [{"start_idx": int(ep[0]),
+             "end_idx": int(ep[-1]),
+             "length": int(ep[-1] - ep[0] + 1),
+             "n_extreme_days": int(len(ep))}
+            for ep in episodes if len(ep) >= min_duration]
+    return pd.DataFrame(rows, columns=["start_idx", "end_idx", "length",
+                                       "n_extreme_days"])
+
+
+def _cluster_within_blocks(indices, blocks, max_gap):
+    """Group sorted event indices into clusters: consecutive members are in
+    the same block and separated by <= max_gap. Returns list of lists."""
+    block_id = {}
+    for bi, blk in enumerate(blocks):
+        for p in blk:
+            block_id[int(p)] = bi
+    groups, current = [], []
+    for idx in indices:
+        idx = int(idx)
+        if idx not in block_id:
+            continue  # outside all blocks: never part of an event
+        if current and (block_id[idx] == block_id[current[-1]]
+                        and idx - current[-1] <= max_gap):
+            current.append(idx)
+        else:
+            if current:
+                groups.append(current)
+            current = [idx]
+    if current:
+        groups.append(current)
+    return groups
+
+
+def detect_compound_events_bivariate(binary_1, binary_2, delT=4, tau=1,
+                                     min_duration_1=1, min_duration_2=1,
+                                     blocks=None, years=None, months=None,
+                                     season_start=6, season_length=4):
+    """Sequential mode: extremes from TWO variables within the linkage
+    window of each other (e.g. a dry spell followed by extreme rain).
+
+    UKCI extension (NOT the paper's single-variable method): clusters the
+    union of both flagged series with the same linkage rule as
+    :func:`detect_compound_events` (gap in ``[tau, tau + delT]`` within one
+    season block) and keeps clusters that contain at least
+    ``min_duration_1`` flagged days from variable 1 AND ``min_duration_2``
+    from variable 2 -- each variable has its own event criterion, symmetric
+    with the per-variable flagging stage.
+
+    Example: "a 20-day drought with >= 19 dry days, followed by 3 days of
+    rain" = flag variable 1 with ``N=20, min_days=19, direction='below'``,
+    flag variable 2 daily (``N=1``), then detect with
+    ``min_duration_1=1, min_duration_2=3``.
+
+    Returns
+    -------
+    pd.DataFrame with columns start_idx, end_idx, length, n_extreme_days,
+    n_extreme_days_1, n_extreme_days_2 (``n_extreme_days`` = sum of both).
+    """
+    import pandas as pd
+
+    b1 = _check_binary("binary_1", binary_1)
+    b2 = _check_binary("binary_2", binary_2)
+    if len(b1) != len(b2):
+        raise ValueError(f"binary_1 (length {len(b1)}) and binary_2 (length "
+                         f"{len(b2)}) must be the same length.")
+    delT, tau = _check_linkage(delT, tau)
+    min_duration_1 = _check_int("min_duration_1", min_duration_1, 1)
+    min_duration_2 = _check_int("min_duration_2", min_duration_2, 1)
+    blks = _resolve_blocks(len(b1), blocks, years, months, season_start,
+                           season_length, "detect_compound_events_bivariate")
+
+    union_idx = np.flatnonzero(np.clip(b1 + b2, 0, 1) == 1)
+    cols = ["start_idx", "end_idx", "length", "n_extreme_days",
+            "n_extreme_days_1", "n_extreme_days_2"]
+    events = []
+    for grp in _cluster_within_blocks(union_idx, blks, tau + delT):
+        n1 = int(b1[grp].sum())
+        n2 = int(b2[grp].sum())
+        if n1 >= min_duration_1 and n2 >= min_duration_2:
+            events.append({"start_idx": grp[0], "end_idx": grp[-1],
+                           "length": grp[-1] - grp[0] + 1,
+                           "n_extreme_days": n1 + n2,
+                           "n_extreme_days_1": n1, "n_extreme_days_2": n2})
+    return pd.DataFrame(events, columns=cols)
+
+
+def detect_compound_events_coincident(binary_1, binary_2, delT=4, tau=1,
+                                      min_duration=1, blocks=None,
+                                      years=None, months=None,
+                                      season_start=6, season_length=4):
+    """Co-occurring mode: TWO variables simultaneously extreme on the same
+    day(s) (e.g. heat + drought).
+
+    UKCI extension (NOT the paper's method): finds days where BOTH flagged
+    series are 1, then merges coincident days separated by
+    <= ``tau + delT`` within one season block. ``min_duration`` is the
+    minimum number of coincident days per event -- since a coincident day is
+    by definition extreme in both variables, per-variable minima coincide
+    with it (``n_extreme_days_1/_2`` >= ``n_coincident_days`` always).
+
+    Returns
+    -------
+    pd.DataFrame with columns start_idx, end_idx, length, n_extreme_days,
+    n_extreme_days_1, n_extreme_days_2, n_coincident_days.
+    ``n_extreme_days_1/_2`` count all flagged days of each variable within
+    the event span.
+    """
+    import pandas as pd
+
+    b1 = _check_binary("binary_1", binary_1)
+    b2 = _check_binary("binary_2", binary_2)
+    if len(b1) != len(b2):
+        raise ValueError(f"binary_1 (length {len(b1)}) and binary_2 (length "
+                         f"{len(b2)}) must be the same length.")
+    delT, tau = _check_linkage(delT, tau)
+    min_duration = _check_int("min_duration", min_duration, 1)
+    blks = _resolve_blocks(len(b1), blocks, years, months, season_start,
+                           season_length, "detect_compound_events_coincident")
+
+    coin_idx = np.flatnonzero((b1 == 1) & (b2 == 1))
+    cols = ["start_idx", "end_idx", "length", "n_extreme_days",
+            "n_extreme_days_1", "n_extreme_days_2", "n_coincident_days"]
+    events = []
+    for grp in _cluster_within_blocks(coin_idx, blks, tau + delT):
+        if len(grp) < min_duration:
+            continue
+        start, end = grp[0], grp[-1]
+        events.append({"start_idx": start, "end_idx": end,
+                       "length": end - start + 1,
+                       "n_extreme_days": len(grp),
+                       "n_extreme_days_1": int(b1[start:end + 1].sum()),
+                       "n_extreme_days_2": int(b2[start:end + 1].sum()),
+                       "n_coincident_days": len(grp)})
+    return pd.DataFrame(events, columns=cols)
+
+
+# --------------------------------------------------------------------------- #
+# loading / ensemble summaries
+# --------------------------------------------------------------------------- #
+def load_region_ensemble(base_dir, region, ensembles,
+                         season_start=6, season_length=4,
+                         filename_pattern="p110{ensemble}_{region}.nc",
+                         return_time=False):
+    """Load a variable for all ensemble members of one region, extracted to
+    a modular season.
+
+    Parameters
+    ----------
+    base_dir : str
+        Root directory containing per-region subfolders.
+    region : str
+        Region name, e.g. 'Wales' -- used for both subfolder and filename.
+    ensembles : list of str
+        Ensemble member IDs, e.g. ['0000', '1113', ...].
+    season_start, season_length : int, optional
+        Modular season spec: start month + duration in months, wrapping the
+        calendar year if needed. Default (6, 4) = June-September. (10, 5) =
+        October-February.
+    filename_pattern : str, optional
+        Filename template with {ensemble} and {region} placeholders.
+    return_time : bool, optional
+        If True, values are ``(data, years, months)`` tuples instead of bare
+        arrays -- pass ``years``/``months`` straight to the detection
+        functions for correct season blocking (required for wrapping
+        seasons).
+
+    Returns
+    -------
+    dict
+        {ensemble_id: data or (data, years, months)}. Members that fail to
+        load are skipped with a printed warning rather than raising.
+    """
+    import os
+    import warnings as _warnings
+    import iris
+
+    # opt in to microsecond date precision, silencing iris's FutureWarning
+    # about legacy date precision at the source
+    try:
+        iris.FUTURE.date_microseconds = True
+    except AttributeError:
+        pass
+
+    month_set = set(season_months(season_start, season_length))
+    in_season = iris.Constraint(
+        time=lambda cell: cell.point.month in month_set)
+
+    member_data = {}
+    for ensemble in ensembles:
+        path = os.path.join(base_dir, region,
+                            filename_pattern.format(ensemble=ensemble,
+                                                    region=region))
+        try:
+            with _warnings.catch_warnings():
+                _warnings.simplefilter("ignore", FutureWarning)
+                cube = iris.load(path)[0]
+                cube = cube.extract(in_season)
+                if return_time:
+                    t = cube.coord("time")
+                    dates = t.units.num2date(t.points)
+                    years = np.array([d.year for d in dates])
+                    months = np.array([d.month for d in dates])
+                    member_data[ensemble] = (cube.data, years, months)
+                else:
+                    member_data[ensemble] = cube.data
+        except Exception as e:
+            print(f"  Warning: could not load ensemble {ensemble} for "
+                  f"{region}: {e}")
+    return member_data
+
+
+def summarise_ensemble_events(events_by_member):
+    """Collapse per-member compound event DataFrames into an ensemble summary
+    (spread of counts per year across members).
 
     Parameters
     ----------
@@ -135,349 +620,26 @@ def summarise_ensemble_events(events_by_member):
 
     Returns
     -------
-    pd.DataFrame
-        One row per year, columns:
-        year, mean, min, max, median, n_members
-        giving the ensemble spread of compound event counts per year.
-
-    Examples
-    --------
-    >>> summary = summarise_ensemble_events(events_by_member)
-    >>> summary[['year', 'min', 'mean', 'max']].head()
+    pd.DataFrame with columns year, mean, min, max, median, n_members.
     """
     import pandas as pd
-    import numpy as np
 
-    # Build a year-by-member count table
     per_member_counts = {}
     for ensemble, df in events_by_member.items():
         if len(df) == 0:
             continue
         per_member_counts[ensemble] = df.groupby('year').size()
- 
+
     if not per_member_counts:
-        return pd.DataFrame(columns=['year', 'mean', 'min', 'max', 'median', 'n_members'])
+        return pd.DataFrame(columns=['year', 'mean', 'min', 'max', 'median',
+                                     'n_members'])
 
     counts_table = pd.DataFrame(per_member_counts).fillna(0)
-
-    summary = pd.DataFrame({
-        'year':      counts_table.index,
-        'mean':      counts_table.mean(axis=1).values,
-        'min':       counts_table.min(axis=1).values,
-        'max':       counts_table.max(axis=1).values,
-        'median':    counts_table.median(axis=1).values,
-        'n_members': (counts_table > 0).sum(axis=1).values,}).reset_index(drop=True)
-
-    return summary
-
-def flag_extreme_events_percentile(timeseries, percentile, N=1, direction='above', flag='all', reference=None):
-    """
-    Flag extreme events using a percentile threshold rather than a fixed value.
-
-    Useful for thermodynamic adjustment — compute the threshold from a reference
-    period, then apply it to any period.
-
-    Parameters
-    timeseries : array-like
-        Input timeseries to flag events in.
-    percentile : float
-        Percentile to use as threshold (0-100).
-    N : int, optional
-        Number of consecutive days that must exceed the threshold to
-        constitute an event. Default is 1 (any single exceedance).
-    direction : str, optional
-        'above' or 'below'. Default 'above'.
-    flag : str, optional
-        Which days in the consecutive window to flag.
-        'last' flags only the last day of the window.
-        'first' flags only the first day of the window.
-        'all' flags all days in the window (default).
-    reference : array-like, optional
-        Data to compute the percentile from. If None, uses timeseries itself.
-        Pass your baseline period data here for thermodynamic adjustment.
-
-    Returns
-    numpy.ndarray
-        Binary array. 1 = extreme event, 0 = not.
-    float
-        The threshold value that was computed and applied.
-    """
-
-    timeseries = np.array(timeseries, dtype=float)
-    ref = np.array(reference, dtype=float) if reference is not None else timeseries
-    threshold = np.percentile(ref, percentile)
-    binary = flag_extreme_events(timeseries, threshold, N=N, direction=direction, flag=flag)
-    return binary, threshold
-
-
-def detect_compound_events(binary_series, delT=4, min_duration=2):
-    '''
-    Detect compound events from a binary timeseries.
-
-    A compound event is a sequence of extreme days where no gap between
-    consecutive extreme days exceeds delT. Returns a DataFrame with one
-    row per event.
-
-    Parameters
-    ----------
-    binary_series : array-like
-        Binary timeseries (1 = extreme day, 0 = not).
-    delT : int, optional
-        Maximum gap in days between extreme days that still counts as part
-        of the same compound event. Default 4.
-    min_duration : int, optional
-        Minimum number of extreme days to qualify as a compound event.
-        Default 2 (single days are excluded).
-
-    Returns
-    -------
-    pd.DataFrame
-        Columns: start_idx, end_idx, length, n_extreme_days
-        One row per compound event.
-
-    '''
-    import pandas as pd
-
-    binary_series = np.array(binary_series, dtype=int)
-    extreme_indices = np.where(binary_series == 1)[0]
-
-    if len(extreme_indices) == 0:
-        return pd.DataFrame(columns=['start_idx', 'end_idx', 'length', 'n_extreme_days'])
-
-    events = []
-    current_event = [extreme_indices[0]]
-
-    for idx in extreme_indices[1:]:
-        if idx - current_event[-1] <= delT:
-            current_event.append(idx)
-        else:
-            if len(current_event) >= min_duration:
-                events.append({
-                    'start_idx':     current_event[0],
-                    'end_idx':       current_event[-1],
-                    'length':        current_event[-1] - current_event[0] + 1,
-                    'n_extreme_days': len(current_event)})
-            current_event = [idx]
-
-    # Don't forget last event
-    if len(current_event) >= min_duration:
-        events.append({
-            'start_idx':      current_event[0],
-            'end_idx':        current_event[-1],
-            'length':         current_event[-1] - current_event[0] + 1,
-            'n_extreme_days': len(current_event)})
-
-    return pd.DataFrame(events)
-
-
-def detect_compound_events_bivariate(binary_1, binary_2, delT=4, min_duration=1):
-    '''
-    Detect compound events that require extremes from two separate timeseries.
-
-    A compound event is a cluster of extreme days drawn from the union of both
-    binary series, where every adjacent pair of extreme days (from either series)
-    is separated by at most delT days, AND the cluster contains at least one
-    extreme day from each series.
-
-    This mirrors the logic of detect_compound_events but enforces the
-    "bivariate" requirement that both variables must contribute to each event.
-
-    Parameters
-    ----------
-    binary_1 : array-like
-        Binary timeseries for variable 1 (1 = extreme, 0 = not).
-    binary_2 : array-like
-        Binary timeseries for variable 2 (1 = extreme, 0 = not).
-        Must be the same length as binary_1.
-    delT : int, optional
-        Maximum gap in days between extreme days (from either series) that
-        still counts as part of the same compound event. Default 4.
-    min_duration : int, optional
-        Minimum total number of extreme days (summed across both series) to
-        qualify as a compound event. Default 1 (all bivariate pairs kept).
-
-    Returns
-    -------
-    pd.DataFrame
-        Columns: start_idx, end_idx, length, n_extreme_days,
-                 n_extreme_days_1, n_extreme_days_2
-        One row per compound event. Only events where both series contribute
-        at least one extreme day are included.
-
-    Examples
-    --------
-    >>> dry = flag_extreme_events(pr, threshold=1, direction='below', N=10)
-    >>> wet = flag_extreme_events(pr, threshold=20, direction='above', N=1)
-    >>> events = detect_compound_events_bivariate(dry, wet, delT=4, min_duration=1)
-    '''
-    import pandas as pd
-
-    b1 = np.array(binary_1, dtype=int)
-    b2 = np.array(binary_2, dtype=int)
-
-    if len(b1) != len(b2):
-        raise ValueError(
-            f"binary_1 (length {len(b1)}) and binary_2 (length {len(b2)}) must be the same length."
-        )
-
-    union = np.clip(b1 + b2, 0, 1)
-    extreme_indices = np.where(union == 1)[0]
-
-    if len(extreme_indices) == 0:
-        return pd.DataFrame(columns=[
-            'start_idx', 'end_idx', 'length',
-            'n_extreme_days', 'n_extreme_days_1', 'n_extreme_days_2',
-        ])
-
-    # Group extreme days from the union series using the same delT logic as
-    # detect_compound_events
-    groups = []
-    current_group = [extreme_indices[0]]
-    for idx in extreme_indices[1:]:
-        if idx - current_group[-1] <= delT:
-            current_group.append(idx)
-        else:
-            groups.append(current_group)
-            current_group = [idx]
-    groups.append(current_group)
-
-    events = []
-    for group in groups:
-        n1 = int(np.sum(b1[group]))
-        n2 = int(np.sum(b2[group]))
-        n_total = n1 + n2
-        # Require at least one extreme from each series AND min_duration total
-        if n1 >= 1 and n2 >= 1 and n_total >= min_duration:
-            events.append({
-                'start_idx':      group[0],
-                'end_idx':        group[-1],
-                'length':         group[-1] - group[0] + 1,
-                'n_extreme_days': n_total,
-                'n_extreme_days_1': n1,
-                'n_extreme_days_2': n2,
-            })
-
-    return pd.DataFrame(events)
-
-
-def detect_compound_events_coincident(binary_1, binary_2, delT=4, min_duration=1):
-    '''
-    Detect compound events where two variables are simultaneously extreme.
-
-    Unlike detect_compound_events_bivariate (sequential pairing), this function
-    requires at least one day where BOTH timeseries flag an extreme on the same
-    day. Adjacent coincident days separated by at most delT are merged into one
-    event.
-
-    Typical use-case: a heat extreme occurring during a drought, where the two
-    variables may come from completely different datasets (e.g. tasmax and a
-    soil-moisture index).
-
-    Parameters
-    ----------
-    binary_1 : array-like
-        Binary timeseries for variable 1 (1 = extreme, 0 = not).
-    binary_2 : array-like
-        Binary timeseries for variable 2 (1 = extreme, 0 = not).
-        Must be the same length as binary_1.
-    delT : int, optional
-        Maximum gap in days between coincident extreme days to merge into
-        the same event. Default 4.
-    min_duration : int, optional
-        Minimum number of simultaneously extreme days (days where both series
-        are 1 on the same day) to qualify as a compound event. Default 1.
-
-    Returns
-    -------
-    pd.DataFrame
-        Columns: start_idx, end_idx, length, n_extreme_days,
-                 n_extreme_days_1, n_extreme_days_2, n_coincident_days
-        n_extreme_days equals n_coincident_days (the count of overlap days).
-        n_extreme_days_1 / _2 count all extreme days from each series within
-        the event span (start_idx to end_idx inclusive).
-
-    Examples
-    --------
-    >>> hot  = flag_extreme_events(tasmax, threshold=30, direction='above', N=1)
-    >>> dry  = flag_extreme_events(precip, threshold=1,  direction='below', N=5)
-    >>> events = detect_compound_events_coincident(hot, dry, delT=4, min_duration=1)
-    '''
-    import pandas as pd
-
-    b1 = np.array(binary_1, dtype=int)
-    b2 = np.array(binary_2, dtype=int)
-
-    if len(b1) != len(b2):
-        raise ValueError(
-            f"binary_1 (length {len(b1)}) and binary_2 (length {len(b2)}) must be the same length."
-        )
-
-    coincident_indices = np.where((b1 == 1) & (b2 == 1))[0]
-
-    if len(coincident_indices) == 0:
-        return pd.DataFrame(columns=[
-            'start_idx', 'end_idx', 'length',
-            'n_extreme_days', 'n_extreme_days_1', 'n_extreme_days_2', 'n_coincident_days',
-        ])
-
-    # Cluster coincident days using the same delT gap logic
-    groups = []
-    current_group = [coincident_indices[0]]
-    for idx in coincident_indices[1:]:
-        if idx - current_group[-1] <= delT:
-            current_group.append(idx)
-        else:
-            groups.append(current_group)
-            current_group = [idx]
-    groups.append(current_group)
-
-    events = []
-    for group in groups:
-        n_coincident = len(group)
-        if n_coincident < min_duration:
-            continue
-        start = group[0]
-        end = group[-1]
-        n1 = int(np.sum(b1[start:end + 1]))
-        n2 = int(np.sum(b2[start:end + 1]))
-        events.append({
-            'start_idx':         start,
-            'end_idx':           end,
-            'length':            end - start + 1,
-            'n_extreme_days':    n_coincident,   # coincident days drive the count
-            'n_extreme_days_1':  n1,
-            'n_extreme_days_2':  n2,
-            'n_coincident_days': n_coincident,
-        })
-
-    return pd.DataFrame(events)
-
-
-def process_binary_series(binary_series, meteo_window=4, max_events_per_window=1):
-    """
-    Remove excess flags within a meteorological window to prevent overcounting.
-
-    If multiple extreme flags fall within meteo_window days of each other,
-    only the first max_events_per_window are kept.
-
-    Parameters
-    binary_series : array-like
-        Binary timeseries of extreme events.
-    meteo_window : int, optional
-        Window size in days. Default 4.
-    max_events_per_window : int, optional
-        Maximum number of events allowed within the window. Default 1.
-
-    """
-    series = np.array(binary_series, dtype=int)
-    idx = np.where(series == 1)[0]
-
-    for i in idx:
-        if series[i] == 1:
-            window_end = min(i + meteo_window + 1, len(series))
-            ones_in_window = np.where(series[i:window_end] == 1)[0] + i
-            if len(ones_in_window) > max_events_per_window:
-                excess_start = ones_in_window[max_events_per_window]
-                series[excess_start:window_end] = 0
-
-    return series.tolist()
+    return pd.DataFrame({
+        'year': counts_table.index,
+        'mean': counts_table.mean(axis=1).values,
+        'min': counts_table.min(axis=1).values,
+        'max': counts_table.max(axis=1).values,
+        'median': counts_table.median(axis=1).values,
+        'n_members': (counts_table > 0).sum(axis=1).values,
+    }).reset_index(drop=True)

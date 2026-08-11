@@ -1,0 +1,43 @@
+"""
+This package is a self-contained copy of ``CoinCalc/eca_analysis`` from the
+paper repository (``giving_david_my_code``). but i made it so they're fully 
+decoupled from the paper repo, so that we can use them in UKCI without having to
+pull in the whole paper repo. The only changes are to remove the paper repo's
+dependencies on UKCI-specific code, and to add a few convenience functions for
+UKCI use cases (e.g. :func:`~threshold_detector.eca_ts`).
+
+"""
+
+from .eca import (
+    ECAResult,
+    eca_ts,
+    eca_blocked,
+    flag_wet_events,
+    jjas_year_blocks,
+    trigger_null_pmf,
+    null_band,
+    SEASON_JJAS,
+)
+from .compound import (
+    compound_membership,
+    compound_episodes,
+    classify_days,
+)
+from .episodes_stats import episode_stats, national_series_from_dates
+from .compound_eca_windows import (
+    WindowConfig,
+    sliding_windows,
+    get_percentile,
+    value_from_percentile,
+    analyse_region,
+    run_window_analysis,
+)
+
+__all__ = [
+    "ECAResult", "eca_ts", "eca_blocked", "flag_wet_events",
+    "jjas_year_blocks", "trigger_null_pmf", "null_band", "SEASON_JJAS",
+    "compound_membership", "compound_episodes", "classify_days",
+    "episode_stats", "national_series_from_dates",
+    "WindowConfig", "sliding_windows", "get_percentile",
+    "value_from_percentile", "analyse_region", "run_window_analysis",
+]
