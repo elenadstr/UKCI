@@ -5,14 +5,61 @@ A Python API for detecting and analysing compound and single extreme events from
 CPM runs.
 
 ## Overview
-The repository contains the  modules:
+The repository contains the modules:
 
-- **`threshold_detector`** — detect extreme events in any climate timeseries,
-  identify compound episodes, and visualise ensemble spread. Designed to be
-  useful standalone or as input to EventCoincidenceAnalysis.
+- **`eca_analysis`** — the vendored counting/ECA engine (single source of
+  truth for the maths; copied self-contained from the paper repository, see
+  `eca_analysis/VENDORED.md` — UKCI has no dependency on that repo).
 
-- **`EventCoincidenceAnalysis`** — test whether the temporal clustering of
-  extreme events exceeds random chance, using Event Coincidence Analysis (ECA) following Donges et al. (2016).
+- **`threshold_detector`** — the user-facing layer: detect extreme events in
+  any climate timeseries (fixed or percentile thresholds, either direction),
+  identify compound episodes, run ECA, and visualise ensemble spread.
+
+- **`EventCoincidenceAnalysis`** — the regional sliding-window analysis
+  notebook (paper Figs. 4-5) and the regional agreement map plotting.
+
+## Method (paper Sections 2.1-2.3)
+
+Two extreme days are linked iff their gap `g` satisfies
+`tau <= g <= tau + delT` **and** both days lie in the same (year, season)
+block — the maximum linkage gap is `tau + delT` days (**5** with the paper
+defaults `tau=1, delT=4`; the "four-day window" of the paper refers to
+`delT`, and Eq. 1's coincidence window has length `delT + 1`). Compound
+events are the connected components of that linkage with at least
+`min_duration` (default 2) extreme days; no window ever spans a season
+boundary. Significance uses Eq. (1)'s binomial null
+(`p = 1 - (1 - (delT+1)/(T - tau))**N`), band = 2.5-97.5% with K indexed
+from 0; `null_model="blocked"` gives the exact per-season Poisson-binomial
+as an advanced alternative.
+
+Because `detect_compound_events` is built on the engine's
+`compound_episodes` (= the self-ECA coincidence indices), the event counts
+and the significance test can never disagree.
+
+## Detection modes
+
+Three modes, demonstrated end-to-end in
+`notebooks/demo_threshold_detector.ipynb` (edit one parameter cell, run all):
+
+1. **single-variable** — sequential extremes of one variable
+   (`detect_compound_events`); this is the paper's method.
+2. **sequential** — extremes from two variables within the linkage window of
+   each other, e.g. a dry spell followed by extreme rain
+   (`detect_compound_events_bivariate`). UKCI extension.
+3. **co-occurring** — both variables extreme on the same day(s), e.g. heat +
+   drought (`detect_compound_events_coincident`). UKCI extension.
+
+Event criteria are set **per variable** at the flagging stage: any variable,
+either direction (`above`/`below`), fixed or percentile thresholds, `N`-day
+windows with an optional `min_days` tolerance (e.g. a 20-day drought with
+>= 19 dry days). The compound stage then applies per-variable minima within
+each event (`min_duration_1`/`min_duration_2` in sequential mode). Seasons
+are modular — `(season_start, season_length)`, wrapping the calendar year if
+needed, with wrapped seasons labelled by their start year — and all modes are
+season-blocked (`years=`/`blocks=` required).
+
+UKCI is pre-release; `CHANGELOG.md` records the method corrections made
+during development so earlier numbers can be reconciled.
 
 
 ## Setup
