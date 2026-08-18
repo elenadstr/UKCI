@@ -3,8 +3,7 @@ threshold_detector
 
 Tools for detecting extreme events, identifying compound episodes, testing
 clustering significance, and visualising ensemble spread. The counting/ECA
-maths is the vendored paper engine (``eca_analysis``, see
-``eca_analysis/VENDORED.md``); this package is the user-facing layer.
+maths is the vendored paper engine; this package is the user-facing layer.
 
 Typical workflow
 ----------------
@@ -38,6 +37,7 @@ Typical workflow
 
 from .detector import (
     flag_extreme_events,
+    compare_flag_options,
     season_months,
     season_year_labels,
     flag_extreme_events_percentile,
@@ -57,6 +57,7 @@ from .coincidence import (
 )
 from .plotting import (
     save_figure,
+    get_hovmoller_data,
     plot_event_timeseries,
     plot_ensemble_hovmoller,
     plot_duration_and_counts,
@@ -75,6 +76,7 @@ from eca_analysis import (
 __all__ = [
     # Detection
     'flag_extreme_events',
+    'compare_flag_options',
     'flag_extreme_events_percentile',
     'thermodynamic_thresholds',
     'detect_compound_events',
@@ -100,6 +102,7 @@ __all__ = [
     # Plotting
     'save_figure',
     'plot_event_timeseries',
+    'get_hovmoller_data',
     'plot_ensemble_hovmoller',
     'plot_duration_and_counts',
     'plot_ensemble_spread',

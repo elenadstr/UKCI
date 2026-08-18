@@ -1,10 +1,6 @@
 """
 threshold_detector/detector.py
 
-User-facing detection layer for UKCI. Flexible extreme-event flagging for any
-variable/threshold direction, plus compound-event identification consistent
-with the paper's counting method.
-
 All counting maths delegates to the vendored engine in :mod:`eca_analysis`
 (see ``eca_analysis/VENDORED.md``); this module adds convenience and the
 UKCI extensions (percentile thresholds, tolerant N-day events, two-variable
@@ -21,8 +17,6 @@ number of flagged days per variable within one event
 (``min_duration`` for single-variable; ``min_duration_1`` /
 ``min_duration_2`` for the two-variable modes).
 
-Compound-event linkage (paper, Section 2.1)
--------------------------------------------
 Two flagged days link iff their gap ``g`` satisfies
 ``tau <= g <= tau + delT`` AND both days lie in the same (year, season)
 block. With the paper defaults ``tau=1, delT=4`` the maximum linkage gap is
@@ -219,12 +213,30 @@ def flag_extreme_events(timeseries, threshold, N=1, min_days=None,
         'above' flags values > threshold (heavy rain, heat);
         'below' flags values < threshold (drought, cold). Default 'above'.
     flag : {'last', 'first', 'all'}, optional
-        Which day(s) of each qualifying window to flag. Default ``'last'``
-        (the day the event completes) -- with ``min_days == N`` this matches
-        the paper engine's ``flag_wet_events`` exactly for every N (enforced
-        in tests). Note ``'last'``/``'first'`` mark the window edge, which
-        with ``min_days < N`` may itself be a non-extreme day. ``'all'``
-        marks only the extreme days inside the window.
+        Which day(s) of each qualifying window to flag. Irrelevant when
+        ``N == 1`` (every extreme day is flagged regardless). For ``N > 1``:
+
+        - ``'last'`` (default): one flag on the day each qualifying window
+          COMPLETES. One flag = one whole event, so downstream
+          ``n_extreme_cases`` counts *events* and ``min_duration=2`` means
+          "at least 2 spells close together". Matches the paper engine's
+          ``flag_wet_events`` exactly when ``min_days == N``. Use when the
+          N-day spell is itself the unit you want to count (heatwaves,
+          dry spells).
+        - ``'first'``: as ``'last'`` but the flag sits on the window START.
+          Same counts, event dates shifted ``N - 1`` days earlier. Use when
+          onset timing matters (e.g. sequencing against a second variable).
+        - ``'all'``: re-marks the extreme DAYS inside qualifying windows.
+          Downstream counts are in raw extreme days and ``min_duration``
+          means "at least that many extreme days". Use when you want
+          day-resolved durations, at the cost of the flag series no longer
+          being "one flag = one event".
+
+        Caveats: ``'last'``/``'first'`` mark the window edge, which with
+        ``min_days < N`` may itself be a non-extreme day; ``'all'`` leaves
+        a spell tail shorter than a full window unflagged. See
+        ``docs/choosing_flag_and_windows.md`` for a worked example, and
+        :func:`compare_flag_options` to view all three on your own data.
 
         The scan jumps past each qualifying window (``i += N``): overlapping
         qualifying windows are not re-flagged, so one long spell yields one
@@ -310,6 +322,60 @@ def flag_extreme_events_percentile(timeseries, percentile, N=1, min_days=None,
     return binary, threshold
 
 
+def compare_flag_options(timeseries, threshold, N=1, min_days=None,
+                         direction='above', show=None):
+    """Side-by-side view of what ``flag='last' / 'first' / 'all'`` each
+    produce on YOUR data -- the fastest way to understand the option.
+
+    Returns a DataFrame with one row per timestep and columns:
+
+    - ``value``     : the input value
+    - ``extreme``   : 1 where the raw value is on the extreme side of
+      ``threshold`` (before any windowing)
+    - ``last``, ``first``, ``all`` : the binary flag series each option
+      yields, exactly as :func:`flag_extreme_events` would return it
+
+    Notes to read off the table
+    ---------------------------
+    * With ``N == 1`` all three columns are identical (``flag`` is
+      irrelevant).
+    * With ``N > 1``, ``'last'``/``'first'`` produce ONE flag per
+      qualifying window -- so a long spell becomes a few sparse flags,
+      spaced ``N`` apart. Whether two spells then link in
+      :func:`detect_compound_events` depends on the gap between *flags*,
+      not between raw extreme days.
+    * With ``min_days < N``, an ``'last'``/``'first'`` flag can sit on a
+      day whose ``extreme`` column is 0 (it marks the window edge, not an
+      extreme day).
+    * ``'all'`` re-marks the extreme days inside qualifying windows, so
+      counts downstream are in raw extreme days -- but a spell tail shorter
+      than a full window stays unflagged.
+
+    Parameters as :func:`flag_extreme_events`. ``show`` optionally slices
+    the returned table to ``show`` rows around the first flag (handy for
+    long series).
+    """
+    import pandas as pd
+
+    timeseries = np.asarray(timeseries, dtype=float)
+    exceeds = (timeseries > threshold) if direction == 'above' \
+        else (timeseries < threshold)
+    out = {"value": timeseries, "extreme": exceeds.astype(int)}
+    for fl in ("last", "first", "all"):
+        out[fl] = flag_extreme_events(timeseries, threshold, N=N,
+                                      min_days=min_days,
+                                      direction=direction, flag=fl)
+    table = pd.DataFrame(out)
+    table.index.name = "idx"
+    if show is not None:
+        flagged = np.flatnonzero(table[["last", "first", "all"]].values.any(
+            axis=1))
+        centre = int(flagged[0]) if len(flagged) else 0
+        lo = max(0, centre - show // 4)
+        table = table.iloc[lo:lo + show]
+    return table
+
+
 def thermodynamic_thresholds(data_by_window, baseline_key, fixed_threshold):
     """Per-window thresholds matching the baseline percentile of a fixed
     impact threshold (paper Section 2.3; mirrors
@@ -384,9 +450,18 @@ def detect_compound_events(binary_series, delT=4, tau=1, min_duration=2,
     Returns
     -------
     pd.DataFrame
-        Columns: start_idx, end_idx, length, n_extreme_days; one row per
+        Columns: start_idx, end_idx, length, n_extreme_cases; one row per
         event. ``length = end_idx - start_idx + 1`` (span in steps),
-        ``n_extreme_days`` is the paper's "duration".
+        ``n_extreme_cases`` is the paper's "duration".
+
+        A **case** is one flagged timestep of the input binary series -- a
+        day for daily data, but the detector is timestep-agnostic (sub-daily
+        or monthly series work identically; the column was previously named
+        ``n_extreme_days``). Note that with ``N > 1`` at the flagging stage
+        each flag represents one qualifying N-step window (under
+        ``flag='last'``/``'first'``), so ``n_extreme_cases`` counts flagged
+        *cases*, not raw extreme days -- see
+        ``docs/choosing_flag_and_windows.md``.
     """
     import pandas as pd
 
@@ -400,10 +475,10 @@ def detect_compound_events(binary_series, delT=4, tau=1, min_duration=2,
     rows = [{"start_idx": int(ep[0]),
              "end_idx": int(ep[-1]),
              "length": int(ep[-1] - ep[0] + 1),
-             "n_extreme_days": int(len(ep))}
+             "n_extreme_cases": int(len(ep))}
             for ep in episodes if len(ep) >= min_duration]
     return pd.DataFrame(rows, columns=["start_idx", "end_idx", "length",
-                                       "n_extreme_days"])
+                                       "n_extreme_cases"])
 
 
 def _cluster_within_blocks(indices, blocks, max_gap):
@@ -452,8 +527,8 @@ def detect_compound_events_bivariate(binary_1, binary_2, delT=4, tau=1,
 
     Returns
     -------
-    pd.DataFrame with columns start_idx, end_idx, length, n_extreme_days,
-    n_extreme_days_1, n_extreme_days_2 (``n_extreme_days`` = sum of both).
+    pd.DataFrame with columns start_idx, end_idx, length, n_extreme_cases,
+    n_extreme_cases_1, n_extreme_cases_2 (``n_extreme_cases`` = sum of both).
     """
     import pandas as pd
 
@@ -469,8 +544,8 @@ def detect_compound_events_bivariate(binary_1, binary_2, delT=4, tau=1,
                            season_length, "detect_compound_events_bivariate")
 
     union_idx = np.flatnonzero(np.clip(b1 + b2, 0, 1) == 1)
-    cols = ["start_idx", "end_idx", "length", "n_extreme_days",
-            "n_extreme_days_1", "n_extreme_days_2"]
+    cols = ["start_idx", "end_idx", "length", "n_extreme_cases",
+            "n_extreme_cases_1", "n_extreme_cases_2"]
     events = []
     for grp in _cluster_within_blocks(union_idx, blks, tau + delT):
         n1 = int(b1[grp].sum())
@@ -478,8 +553,8 @@ def detect_compound_events_bivariate(binary_1, binary_2, delT=4, tau=1,
         if n1 >= min_duration_1 and n2 >= min_duration_2:
             events.append({"start_idx": grp[0], "end_idx": grp[-1],
                            "length": grp[-1] - grp[0] + 1,
-                           "n_extreme_days": n1 + n2,
-                           "n_extreme_days_1": n1, "n_extreme_days_2": n2})
+                           "n_extreme_cases": n1 + n2,
+                           "n_extreme_cases_1": n1, "n_extreme_cases_2": n2})
     return pd.DataFrame(events, columns=cols)
 
 
@@ -495,13 +570,13 @@ def detect_compound_events_coincident(binary_1, binary_2, delT=4, tau=1,
     <= ``tau + delT`` within one season block. ``min_duration`` is the
     minimum number of coincident days per event -- since a coincident day is
     by definition extreme in both variables, per-variable minima coincide
-    with it (``n_extreme_days_1/_2`` >= ``n_coincident_days`` always).
+    with it (``n_extreme_cases_1/_2`` >= ``n_coincident_cases`` always).
 
     Returns
     -------
-    pd.DataFrame with columns start_idx, end_idx, length, n_extreme_days,
-    n_extreme_days_1, n_extreme_days_2, n_coincident_days.
-    ``n_extreme_days_1/_2`` count all flagged days of each variable within
+    pd.DataFrame with columns start_idx, end_idx, length, n_extreme_cases,
+    n_extreme_cases_1, n_extreme_cases_2, n_coincident_cases.
+    ``n_extreme_cases_1/_2`` count all flagged days of each variable within
     the event span.
     """
     import pandas as pd
@@ -517,8 +592,8 @@ def detect_compound_events_coincident(binary_1, binary_2, delT=4, tau=1,
                            season_length, "detect_compound_events_coincident")
 
     coin_idx = np.flatnonzero((b1 == 1) & (b2 == 1))
-    cols = ["start_idx", "end_idx", "length", "n_extreme_days",
-            "n_extreme_days_1", "n_extreme_days_2", "n_coincident_days"]
+    cols = ["start_idx", "end_idx", "length", "n_extreme_cases",
+            "n_extreme_cases_1", "n_extreme_cases_2", "n_coincident_cases"]
     events = []
     for grp in _cluster_within_blocks(coin_idx, blks, tau + delT):
         if len(grp) < min_duration:
@@ -526,10 +601,10 @@ def detect_compound_events_coincident(binary_1, binary_2, delT=4, tau=1,
         start, end = grp[0], grp[-1]
         events.append({"start_idx": start, "end_idx": end,
                        "length": end - start + 1,
-                       "n_extreme_days": len(grp),
-                       "n_extreme_days_1": int(b1[start:end + 1].sum()),
-                       "n_extreme_days_2": int(b2[start:end + 1].sum()),
-                       "n_coincident_days": len(grp)})
+                       "n_extreme_cases": len(grp),
+                       "n_extreme_cases_1": int(b1[start:end + 1].sum()),
+                       "n_extreme_cases_2": int(b2[start:end + 1].sum()),
+                       "n_coincident_cases": len(grp)})
     return pd.DataFrame(events, columns=cols)
 
 

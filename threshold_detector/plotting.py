@@ -31,7 +31,8 @@ def plot_event_timeseries(compound_dates, single_dates=None, rolling_window=10, 
     '''
     Plot annual counts of compound (and optionally single) extreme events with a rolling mean overlay.
 
-    Parametres@ 
+    Parameters
+    ----------
     compound_dates : array-like of datetime-like
         Dates of compound extreme events. Each date counts once per year.
     single_dates : array-like of datetime-like, optional
@@ -63,7 +64,7 @@ def plot_event_timeseries(compound_dates, single_dates=None, rolling_window=10, 
     ax.plot(compound_rolling.index, compound_rolling.values, linestyle='-', color=compound_colour, linewidth=2.5, label=f'Compound ({rolling_window}-yr mean)')
 
     ax.set_xlabel('Year')
-    ax.set_ylabel('Number of days')
+    ax.set_ylabel('Number of events')
     ax.legend()
     _add_ipcc_title(
         fig,
@@ -78,11 +79,145 @@ def plot_event_timeseries(compound_dates, single_dates=None, rolling_window=10, 
 
 
 
+def _resolve_case_col(events_df, duration_col):
+    """Back-compat shim: accept DataFrames still carrying the pre-rename
+    ``n_extreme_days`` column (renamed ``n_extreme_cases``)."""
+    import warnings
+    if duration_col is None or duration_col in events_df.columns:
+        return duration_col
+    if duration_col == 'n_extreme_cases' and 'n_extreme_days' \
+            in events_df.columns:
+        warnings.warn("column 'n_extreme_days' was renamed "
+                      "'n_extreme_cases'; using the old column. Re-run "
+                      "detection to get the new name.", DeprecationWarning,
+                      stacklevel=3)
+        return 'n_extreme_days'
+    raise KeyError(f"column {duration_col!r} not in events_df "
+                   f"(columns: {list(events_df.columns)})")
+
+
+def get_hovmoller_data(events_df, ensemble_col='ensemble', year_col='year',
+                       case_col='n_extreme_cases', length_col='length',
+                       years=None, ensembles=None, extra_cols='auto'):
+    """The data behind the Hovmoller plots, as a tidy DataFrame: one row per
+    (ensemble member, year) cell, zeros filled for empty cells.
+
+    Works for all three detection modes -- pass the concatenated events
+    DataFrame from :func:`detect_compound_events` (single-variable),
+    ``detect_compound_events_bivariate`` or
+    ``detect_compound_events_coincident`` (with ``year``/``ensemble``
+    columns attached, as in the demo notebook). Per-variable columns
+    (``n_extreme_cases_1/_2``, ``n_coincident_cases``) are summed
+    automatically when present.
+
+    This is the single source of truth for
+    :func:`plot_ensemble_hovmoller` -- use it directly to drive an
+    interactive front-end (hover tooltips, plotly, etc.) or to export the
+    numbers, guaranteed to match the figures.
+
+    Parameters
+    ----------
+    events_df : pd.DataFrame
+        One row per event; must contain ``ensemble_col`` and ``year_col``.
+    ensemble_col, year_col, case_col, length_col : str
+        Column names. ``case_col='n_extreme_cases'`` (falls back to the
+        pre-rename ``n_extreme_days`` with a DeprecationWarning);
+        pass ``None`` to skip the duration statistics.
+    years, ensembles : array-like, optional
+        Full grids for the axes. Default: the values present in
+        ``events_df``; pass e.g. ``years=range(1981, 2080)`` so years with
+        no events anywhere still appear as zero rows.
+    extra_cols : 'auto' or list of str
+        Additional per-event columns to sum per cell. ``'auto'`` picks up
+        ``n_extreme_cases_1``, ``n_extreme_cases_2`` and
+        ``n_coincident_cases`` if present.
+
+    Returns
+    -------
+    pd.DataFrame with one row per (ensemble, year) and columns:
+
+    - ``ensemble``, ``year``
+    - ``n_events``       : number of events in the cell
+    - ``n_extreme_cases``: total flagged cases (timesteps) across events
+    - ``max_duration``   : largest single-event ``case_col`` value
+    - ``mean_duration``  : mean ``case_col`` per event (NaN if no events)
+    - ``mean_length``    : mean span (``length_col``) per event (NaN if none)
+    - ``durations``      : list of per-event ``case_col`` values, in event
+      order -- ready for a tooltip like "3 events lasting 2, 4 and 7 cases"
+    - any ``extra_cols`` (summed per cell)
+    """
+    import warnings
+
+    case_col = _resolve_case_col(events_df, case_col)
+    if length_col is not None and length_col not in events_df.columns:
+        raise KeyError(f"length_col {length_col!r} not in events_df")
+
+    if extra_cols == 'auto':
+        extra_cols = [c for c in ('n_extreme_cases_1', 'n_extreme_cases_2',
+                                  'n_coincident_cases',
+                                  'n_extreme_days_1', 'n_extreme_days_2',
+                                  'n_coincident_days')
+                      if c in events_df.columns]
+    else:
+        extra_cols = list(extra_cols or [])
+
+    if ensembles is None:
+        ensembles = sorted(events_df[ensemble_col].unique())
+    if years is None:
+        years = sorted(events_df[year_col].unique())
+    years = [int(y) for y in years]
+
+    grouped = events_df.groupby([ensemble_col, year_col])
+    rows = []
+    for ens in ensembles:
+        for yr in years:
+            try:
+                g = grouped.get_group((ens, yr))
+            except KeyError:
+                g = None
+            row = {'ensemble': ens, 'year': yr,
+                   'n_events': 0 if g is None else len(g)}
+            if case_col is not None:
+                if g is None or len(g) == 0:
+                    row.update({'n_extreme_cases': 0, 'max_duration': 0,
+                                'mean_duration': np.nan,
+                                'durations': []})
+                else:
+                    d = g[case_col].to_numpy()
+                    row.update({'n_extreme_cases': int(d.sum()),
+                                'max_duration': int(d.max()),
+                                'mean_duration': float(d.mean()),
+                                'durations': [int(x) for x in d]})
+            if length_col is not None:
+                row['mean_length'] = (np.nan if g is None or len(g) == 0
+                                      else float(g[length_col].mean()))
+            for c in extra_cols:
+                row[c] = 0 if g is None else int(g[c].sum())
+            rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def _hovmoller_hover_text(cell):
+    """One-line hover/tooltip description of a (ensemble, year) cell of
+    :func:`get_hovmoller_data`."""
+    if cell['n_events'] == 0:
+        return (f"{cell['ensemble']} | {cell['year']}: no events")
+    dur = cell.get('durations')
+    dur_txt = ''
+    if isinstance(dur, list) and dur:
+        dur_txt = (f" lasting {', '.join(str(d) for d in dur)} "
+                   f"case{'s' if max(dur) != 1 else ''}")
+    return (f"{cell['ensemble']} | {cell['year']}: "
+            f"{cell['n_events']} event{'s' if cell['n_events'] != 1 else ''}"
+            f"{dur_txt}")
+
+
 def plot_ensemble_hovmoller(events_df, ensemble_col='ensemble',
                             year_col='year', count_col=None,
-                            duration_col='n_extreme_days',
+                            duration_col='n_extreme_cases',
                             length_col='length',
-                            cmap='Blues', figsize=(14, 5)):
+                            cmap='Blues', figsize=(14, 5),
+                            hover=True, data=None):
     """
     Hovmoller-style heatmaps (ensemble member x year) of the compound-event
     record.
@@ -90,17 +225,27 @@ def plot_ensemble_hovmoller(events_df, ensemble_col='ensemble',
     Produces up to FIVE figures, returned as a dict:
 
     - ``'events'``        : number of events per member per year
-    - ``'days'``          : total extreme days per member per year
-    - ``'max_duration'``  : the maximum total duration (extreme days) of any
-                            single event, per member per year
-    - ``'mean_duration'`` : mean event duration (extreme days) per member
+    - ``'cases'``         : total extreme cases (flagged timesteps) per
+                            member per year (this key was ``'days'`` before
+                            the ``n_extreme_days`` -> ``n_extreme_cases``
+                            rename)
+    - ``'max_duration'``  : the maximum total duration (extreme cases) of
+                            any single event, per member per year
+    - ``'mean_duration'`` : mean event duration (extreme cases) per member
                             per year
-    - ``'mean_length'``   : mean event length (span in days, end - start + 1)
+    - ``'mean_length'``   : mean event length (span, end - start + 1)
                             per member per year
 
     The duration panels need ``duration_col`` and the length panel needs
     ``length_col``; pass ``None`` to skip (the corresponding dict entry is
     then absent).
+
+    All panels are built from :func:`get_hovmoller_data`, so the figures
+    and the exported table can never disagree. With ``hover=True`` (and an
+    interactive matplotlib backend, e.g. ``%matplotlib widget``), moving
+    the mouse over a cell shows "member | year: k events lasting a, b, c
+    cases" -- in the toolbar/status area always, and as a cursor tooltip
+    too when the optional ``mplcursors`` package is installed.
 
     Parameters
     ----------
@@ -112,49 +257,55 @@ def plot_ensemble_hovmoller(events_df, ensemble_col='ensemble',
         If provided, the 'events' panel sums this column instead of counting
         rows (for pre-aggregated inputs).
     duration_col : str or None, optional
-        Column with each event's total duration in extreme days. Default
-        'n_extreme_days'.
+        Column with each event's total duration in extreme cases. Default
+        'n_extreme_cases' (accepts the pre-rename 'n_extreme_days' with a
+        DeprecationWarning).
     length_col : str or None, optional
         Column with each event's length (span). Default 'length'.
     cmap : str, optional
     figsize : tuple, optional
+    hover : bool, optional
+        Attach the per-cell hover text (default True; needs an interactive
+        backend to be visible).
+    data : pd.DataFrame, optional
+        A precomputed :func:`get_hovmoller_data` table; computed from
+        ``events_df`` if omitted.
 
     Returns
     -------
     dict of {name: matplotlib Figure}
     """
-    ensembles = sorted(events_df[ensemble_col].unique())
-    all_years = sorted(events_df[year_col].unique())
+    duration_col = _resolve_case_col(events_df, duration_col)
+    if data is None:
+        data = get_hovmoller_data(events_df, ensemble_col=ensemble_col,
+                                  year_col=year_col, case_col=duration_col,
+                                  length_col=length_col)
+    ensembles = sorted(data['ensemble'].unique())
+    all_years = sorted(data['year'].unique())
     n_ens = len(ensembles)
-    n_years = len(all_years)
-    ens_to_idx = {e: i for i, e in enumerate(ensembles)}
-    yr_to_idx = {y: i for i, y in enumerate(all_years)}
 
-    event_matrix = np.zeros((n_ens, n_years))
-    days_matrix = np.zeros((n_ens, n_years))
-    max_dur_matrix = np.zeros((n_ens, n_years))
-    dur_sum = np.zeros((n_ens, n_years))
-    len_sum = np.zeros((n_ens, n_years))
-    n_events = np.zeros((n_ens, n_years))
+    def _pivot(col, fill=0.0):
+        return (data.pivot(index='ensemble', columns='year', values=col)
+                .reindex(index=ensembles, columns=all_years)
+                .fillna(fill).to_numpy(dtype=float))
 
-    for _, row in events_df.iterrows():
-        ei = ens_to_idx.get(row[ensemble_col])
-        yi = yr_to_idx.get(row[year_col])
-        if ei is None or yi is None:
-            continue
-        event_matrix[ei, yi] += 1 if count_col is None else row[count_col]
-        n_events[ei, yi] += 1
-        if duration_col is not None:
-            d = row[duration_col]
-            days_matrix[ei, yi] += d
-            max_dur_matrix[ei, yi] = max(max_dur_matrix[ei, yi], d)
-            dur_sum[ei, yi] += d
-        if length_col is not None:
-            len_sum[ei, yi] += row[length_col]
+    n_events = _pivot('n_events')
+    if count_col is None:
+        event_matrix = n_events
+    else:
+        # pre-aggregated input: sum count_col per cell
+        agg = (events_df.groupby([ensemble_col, year_col])[count_col].sum()
+               .unstack().reindex(index=ensembles, columns=all_years)
+               .fillna(0))
+        event_matrix = agg.to_numpy(dtype=float)
 
     # order members by total event count (ascending), shared by all panels
     sort_order = np.argsort(event_matrix.sum(axis=1))
     labels = [ensembles[i] for i in sort_order]
+
+    # hover text per (sorted-row, year) cell
+    hover_lookup = {(r['ensemble'], r['year']): _hovmoller_hover_text(r)
+                    for _, r in data.iterrows()}
 
     def _make(matrix, heading, sub_heading, cbar_label):
         fig, ax = plt.subplots(figsize=figsize)
@@ -167,6 +318,34 @@ def plot_ensemble_hovmoller(events_df, ensemble_col='ensemble',
         ax.set_ylabel('Ensemble member')
         fig.colorbar(c, ax=ax, label=cbar_label)
         _add_ipcc_title(fig, heading, sub_heading)
+
+        if hover:
+            year_arr = np.asarray(all_years)
+
+            def _fmt(x, y, _default=ax.format_coord):
+                yi = int(round(y))
+                xi = int(np.argmin(np.abs(year_arr - x)))
+                if 0 <= yi < n_ens and abs(year_arr[xi] - x) <= 0.5:
+                    key = (labels[yi], int(year_arr[xi]))
+                    txt = hover_lookup.get(key)
+                    if txt:
+                        return txt
+                return _default(x, y)
+
+            ax.format_coord = _fmt  # status-bar hover, no dependencies
+            try:                    # optional richer tooltip
+                import mplcursors
+
+                cur = mplcursors.cursor(c, hover=True)
+
+                @cur.connect("add")
+                def _(sel):
+                    j, i = divmod(sel.index, len(year_arr))
+                    key = (labels[j], int(year_arr[i]))
+                    sel.annotation.set_text(
+                        hover_lookup.get(key, ''))
+            except ImportError:
+                pass
         return fig
 
     figs = {'events': _make(
@@ -176,32 +355,30 @@ def plot_ensemble_hovmoller(events_df, ensemble_col='ensemble',
         'ordered by total event count.', 'Events')}
 
     if duration_col is not None:
-        with np.errstate(invalid='ignore'):
-            mean_dur = np.where(n_events > 0, dur_sum / n_events, 0.0)
-        figs['days'] = _make(
-            days_matrix,
-            'Ensemble-year Hovmoller diagram of extreme day totals',
-            'Total number of extreme days in compound events per year for '
-            'each ensemble member.', 'Extreme days')
+        figs['cases'] = _make(
+            _pivot('n_extreme_cases'),
+            'Ensemble-year Hovmoller diagram of extreme case totals',
+            'Total number of extreme cases (flagged timesteps) in compound '
+            'events per year for each ensemble member.', 'Extreme cases')
         figs['max_duration'] = _make(
-            max_dur_matrix,
+            _pivot('max_duration'),
             'Ensemble-year Hovmoller diagram of maximum event duration',
-            'Maximum total duration (extreme days) of any single compound '
-            'event in each year, per ensemble member.', 'Max duration (days)')
+            'Maximum total duration (extreme cases) of any single compound '
+            'event in each year, per ensemble member.',
+            'Max duration (cases)')
         figs['mean_duration'] = _make(
-            mean_dur,
+            _pivot('mean_duration'),
             'Ensemble-year Hovmoller diagram of mean event duration',
-            'Mean duration (extreme days per event) of compound events in '
-            'each year, per ensemble member.', 'Mean duration (days)')
+            'Mean duration (extreme cases per event) of compound events in '
+            'each year, per ensemble member.', 'Mean duration (cases)')
 
     if length_col is not None:
-        with np.errstate(invalid='ignore'):
-            mean_len = np.where(n_events > 0, len_sum / n_events, 0.0)
         figs['mean_length'] = _make(
-            mean_len,
+            _pivot('mean_length'),
             'Ensemble-year Hovmoller diagram of mean event length',
-            'Mean length (span in days, end - start + 1) of compound events '
-            'in each year, per ensemble member.', 'Mean length (days)')
+            'Mean length (span in timesteps, end - start + 1) of compound '
+            'events in each year, per ensemble member.',
+            'Mean length (timesteps)')
 
     return figs
 
