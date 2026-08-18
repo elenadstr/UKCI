@@ -96,6 +96,121 @@ def _resolve_case_col(events_df, duration_col):
                    f"(columns: {list(events_df.columns)})")
 
 
+def get_annual_stats(events_df, year_col='year', ensemble_col=None,
+                     duration_col='n_extreme_cases', length_col='length',
+                     years=None):
+    """
+    Summarise event records into annual statistics — no plotting, no mesh.
+
+    Returns a tidy DataFrame with one row per year (or per ensemble-member /
+    year combination when *ensemble_col* is given) that is ready to hand off
+    to any plotting library (Plotly, Seaborn, Bokeh, …).
+
+    Parameters
+    ----------
+    events_df : pd.DataFrame
+        One row per event.  Must contain *year_col* and whichever of
+        *duration_col* / *length_col* you want statistics for.
+    year_col : str
+        Column that holds the event year.  Default ``'year'``.
+    ensemble_col : str or None
+        If given, group by (ensemble, year) and include an ``'ensemble'``
+        column in the output.  Default ``None`` (aggregate all members).
+    duration_col : str or None
+        Column with the total duration of each event in extreme cases /
+        timesteps (e.g. ``'n_extreme_cases'``).  Pass ``None`` to skip
+        duration statistics.
+    length_col : str or None
+        Column with the span of each event in timesteps
+        (``end - start + 1``).  Pass ``None`` to skip length statistics.
+    years : array-like of int, optional
+        Full year grid to use.  Years with no events appear as rows of
+        zeros / NaN.  Defaults to the years present in *events_df*.
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns present:
+
+        - ``year``
+        - ``ensemble``          *(only when ensemble_col is given)*
+        - ``n_events``          : number of events
+        - ``total_duration``    : sum of *duration_col* across events
+        - ``mean_duration``     : mean *duration_col* per event (NaN if none)
+        - ``max_duration``      : largest *duration_col* value (0 if none)
+        - ``total_length``      : sum of *length_col* across events
+        - ``mean_length``       : mean *length_col* per event (NaN if none)
+        - ``max_length``        : largest *length_col* value (0 if none)
+
+    Examples
+    --------
+    >>> stats = get_annual_stats(events_df)
+    >>> # hand off to plotly:
+    >>> import plotly.express as px
+    >>> fig = px.bar(stats, x='year', y='n_events')
+    >>> fig.show()
+
+    >>> # per ensemble member:
+    >>> stats = get_annual_stats(events_df, ensemble_col='ensemble')
+    >>> fig = px.line(stats, x='year', y='mean_duration', color='ensemble')
+    """
+    duration_col = _resolve_case_col(events_df, duration_col)
+    if length_col is not None and length_col not in events_df.columns:
+        raise KeyError(f"length_col {length_col!r} not in events_df")
+
+    if years is None:
+        years = sorted(events_df[year_col].unique())
+    years = [int(y) for y in years]
+
+    group_keys = ([ensemble_col, year_col] if ensemble_col else [year_col])
+    grouped = events_df.groupby(group_keys)
+
+    if ensemble_col:
+        ensembles = sorted(events_df[ensemble_col].unique())
+        combos = [(ens, yr) for ens in ensembles for yr in years]
+    else:
+        combos = years
+
+    rows = []
+    for combo in combos:
+        try:
+            g = grouped.get_group(combo)
+        except KeyError:
+            g = None
+
+        if ensemble_col:
+            ens, yr = combo
+            row = {'ensemble': ens, 'year': yr}
+        else:
+            row = {'year': combo}
+
+        row['n_events'] = 0 if g is None else len(g)
+
+        if duration_col is not None:
+            if g is None or len(g) == 0:
+                row.update({'total_duration': 0, 'mean_duration': float('nan'),
+                            'max_duration': 0})
+            else:
+                d = g[duration_col].to_numpy()
+                row.update({'total_duration': int(d.sum()),
+                            'mean_duration': float(d.mean()),
+                            'max_duration': int(d.max())})
+
+        if length_col is not None:
+            if g is None or len(g) == 0:
+                row.update({'total_length': 0, 'mean_length': float('nan'),
+                            'max_length': 0})
+            else:
+                ln = g[length_col].to_numpy()
+                row.update({'total_length': int(ln.sum()),
+                            'mean_length': float(ln.mean()),
+                            'max_length': int(ln.max())})
+
+        rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
 def get_hovmoller_data(events_df, ensemble_col='ensemble', year_col='year',
                        case_col='n_extreme_cases', length_col='length',
                        years=None, ensembles=None, extra_cols='auto'):
