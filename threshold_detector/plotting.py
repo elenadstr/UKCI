@@ -211,10 +211,63 @@ def get_annual_stats(events_df, year_col='year', ensemble_col=None,
     return pd.DataFrame(rows)
 
 
+def get_annual_stats_by_variable(events_by_variable, year_col='year',
+                                 ensemble_col=None,
+                                 duration_col='n_extreme_cases',
+                                 length_col='length', years=None):
+    """
+    calc annual statistics for each individual input variable separately
+
+    Thin wrapper around :func:`get_annual_stats`: calls it once per variable
+    and tags each result with a ``variable`` column, then returns a single
+    concatenated DataFrame.
+
+    Parameters
+    ----------
+    events_by_variable : dict of {str: pd.DataFrame}
+        One entry per variable,
+
+        Each DataFrame is the output of :func:`detect_compound_events` run
+        on that variable alone, with ``year_col`` (and optionally
+        ``ensemble_col``) already attached.
+    year_col, ensemble_col, duration_col, length_col, years
+        Forwarded to :func:`get_annual_stats` unchanged — see its docstring
+        for details.
+
+    Returns
+    -------
+    pd.DataFrame
+        All rows from every variable stacked together, with an extra leading
+        ``variable`` column.  Columns present:
+
+        - ``variable``          : key from *events_by_variable*
+        - ``year``
+        - ``ensemble``          *(only when ensemble_col is given)*
+        - ``n_events``
+        - ``total_duration``, ``mean_duration``, ``max_duration``
+        - ``total_length``,   ``mean_length``,   ``max_length``
+    """
+    pieces = []
+    for name, df in events_by_variable.items():
+        part = get_annual_stats(
+            df,
+            year_col=year_col,
+            ensemble_col=ensemble_col,
+            duration_col=duration_col,
+            length_col=length_col,
+            years=years,
+        )
+        part.insert(0, 'variable', name)
+        pieces.append(part)
+    if not pieces:
+        raise ValueError("events_by_variable is empty :(")
+    return pd.concat(pieces, ignore_index=True)
+
+
 def get_hovmoller_data(events_df, ensemble_col='ensemble', year_col='year',
                        case_col='n_extreme_cases', length_col='length',
                        years=None, ensembles=None, extra_cols='auto'):
-    """The data behind the Hovmoller plots, as a tidy DataFrame: one row per
+    """data behind the Hovmoller plots, as a tidy DataFrame: one row per
     (ensemble member, year) cell, zeros filled for empty cells.
 
     Works for all three detection modes -- pass the concatenated events
