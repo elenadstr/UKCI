@@ -264,6 +264,124 @@ def get_annual_stats_by_variable(events_by_variable, year_col='year',
     return pd.concat(pieces, ignore_index=True)
 
 
+def get_flag_annual_stats(binary, years, min_duration=1,
+                          ensemble=None, year_range=None):
+    """
+    Annual stats directly from a binary flag series
+    (output of :func:`~threshold_detector.detector.flag_extreme_events`),
+before any cross-variable compounding or ECA linkage.
+
+    Identifies every maximal run of consecutive 1s as one spell, optionally
+    filters short spells out, assigns each spell to the year of its first
+    flagged timestep, and returns the same seven statistics as
+    :func:`get_annual_stats`.
+
+    params
+    ----------
+    binary : array-like of int
+        1-D binary array from ``flag_extreme_events`` (or
+        ``flag_extreme_events_percentile``).
+    years : array-like of int
+        Year lbel` for every timestep. Must be the same length as binary.
+    min_duration : int, optional
+        Minimum number of consectuve flagged timesteps for a spell to be
+        kept.  Default ``1`` (keep all).  Set to e.g. ``2`` to drop
+        isolated single flags produced by ``N=1`` flagging.
+    ensemble : str or None, optional
+        If given, an ``'ensemble'`` column with this value is added —
+        useful when stacking results from multiple members with
+        ``pd.concat``.
+    year_range : (int, int), optional
+        Inclusive ``(start_year, end_year)``.  Years outside this range
+        appear as zero rows; years in the range but absent in *binary*
+        also appear as zero rows.  Default: the years present in *years*.
+
+    Returns
+    -------
+    pd.DataFrame
+        One row per year.  Columns:
+
+        - ``year``
+        - ``ensemble``       *(only when ensemble is given)*
+        - ``n_events``       : number of spells that year
+        - ``total_duration`` : total flagged timesteps across all spells
+        - ``mean_duration``  : mean flagged timesteps per spell (NaN if none)
+        - ``max_duration``   : flagged timesteps in the longest spell
+        - ``total_length``   : total span (end - start + 1) across spells
+        - ``mean_length``    : mean span per spell (NaN if none)
+        - ``max_length``     : span of the longest spell
+
+        For a maximal run of 1s ``duration == length`` (every step is
+        flagged); both columns are returned for consistency with
+        :func:`get_annual_stats`.
+    """
+    binary = np.asarray(binary, dtype=int)
+    years  = np.asarray(years,  dtype=int)
+    if binary.ndim != 1:
+        raise ValueError("binary must be 1-D")
+    if len(binary) != len(years):
+        raise ValueError("binary and years must be the same length")
+
+    # ---- find maximal runs of consecutive 1s ----------------------------
+    spells = []  # list of (start_idx, end_idx)
+    i = 0
+    n = len(binary)
+    while i < n:
+        if binary[i] == 1:
+            j = i
+            while j < n and binary[j] == 1:
+                j += 1
+            spells.append((i, j - 1))
+            i = j
+        else:
+            i += 1
+
+    # ---- filter and tag with year ---------------------------------------
+    spell_years, lengths = [], []
+    for start, end in spells:
+        ln = end - start + 1
+        if ln >= min_duration:
+            spell_years.append(int(years[start]))
+            lengths.append(ln)
+
+    # ---- build full year grid ------------------------------------------
+    if year_range is not None:
+        all_years = list(range(int(year_range[0]), int(year_range[1]) + 1))
+    else:
+        all_years = sorted(set(map(int, years)))
+
+    # ---- aggregate per year --------------------------------------------
+    rows = []
+    spell_yr_arr = np.array(spell_years, dtype=int) if spell_years else \
+        np.empty(0, dtype=int)
+    len_arr = np.array(lengths, dtype=int) if lengths else \
+        np.empty(0, dtype=int)
+
+    for yr in all_years:
+        mask = spell_yr_arr == yr
+        n_ev = int(mask.sum())
+        row  = {'year': yr}
+        if ensemble is not None:
+            row['ensemble'] = ensemble
+        row['n_events'] = n_ev
+        if n_ev == 0:
+            row.update({'total_duration': 0, 'mean_duration': float('nan'),
+                        'max_duration':   0,
+                        'total_length':   0, 'mean_length':   float('nan'),
+                        'max_length':     0})
+        else:
+            ev_lengths = len_arr[mask]
+            row.update({'total_duration': int(ev_lengths.sum()),
+                        'mean_duration':  float(ev_lengths.mean()),
+                        'max_duration':   int(ev_lengths.max()),
+                        'total_length':   int(ev_lengths.sum()),
+                        'mean_length':    float(ev_lengths.mean()),
+                        'max_length':     int(ev_lengths.max())})
+        rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
 def get_hovmoller_data(events_df, ensemble_col='ensemble', year_col='year',
                        case_col='n_extreme_cases', length_col='length',
                        years=None, ensembles=None, extra_cols='auto'):

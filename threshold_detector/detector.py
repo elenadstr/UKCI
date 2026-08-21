@@ -325,7 +325,7 @@ def flag_extreme_events_percentile(timeseries, percentile, N=1, min_days=None,
 def compare_flag_options(timeseries, threshold, N=1, min_days=None,
                          direction='above', show=None):
     """Side-by-side view of what ``flag='last' / 'first' / 'all'`` each
-    produce on YOUR data -- the fastest way to understand the option.
+    produce on the datra.
 
     Returns a DataFrame with one row per timestep and columns:
 
@@ -411,11 +411,6 @@ def detect_compound_events(binary_series, delT=4, tau=1, min_duration=2,
     """Single-variable mode: sequential extremes of ONE variable (the
     paper's method, Section 2.1).
 
-    Flagged days link iff their gap ``g`` satisfies ``tau <= g <= tau +
-    delT`` (max gap ``tau + delT`` days -- **5** with the defaults) within
-    the same season block; compound events are the connected components with
-    at least ``min_duration`` flagged days.
-
     Implemented on :func:`eca_analysis.compound_episodes`, so the events
     returned here are exactly the episodes implied by the self-ECA
     coincidence indices -- the counting and the significance test can never
@@ -477,9 +472,6 @@ def detect_compound_events(binary_series, delT=4, tau=1, min_duration=2,
              "length": int(ep[-1] - ep[0] + 1),
              "n_extreme_cases": int(len(ep))}
             for ep in episodes if len(ep) >= min_duration]
-    return pd.DataFrame(rows, columns=["start_idx", "end_idx", "length",
-                                       "n_extreme_cases"])
-
 
 def _cluster_within_blocks(indices, blocks, max_gap):
     """Group sorted event indices into clusters: consecutive members are in
