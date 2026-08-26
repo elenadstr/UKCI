@@ -98,7 +98,8 @@ def _resolve_case_col(events_df, duration_col):
 
 def get_annual_stats(events_df, year_col='year', ensemble_col=None,
                      duration_col='n_extreme_cases', length_col='length',
-                     years=None):
+                     years=None, months_col=None, season_start=1,
+                     season_length=12):
     """
     Summarise event records into annual statistics — no plotting, no mesh.
 
@@ -126,6 +127,15 @@ def get_annual_stats(events_df, year_col='year', ensemble_col=None,
     years : array-like of int, optional
         Full year grid to use.  Years with no events appear as rows of
         zeros / NaN.  Defaults to the years present in *events_df*.
+    months_col : str or None, optional
+        Column in *events_df* containing the start month (1-12) of each
+        event.  When provided, events whose month falls outside the
+        season defined by *season_start* / *season_length* are excluded
+        before aggregation.  Default ``None`` (no filtering).
+    season_start : int, optional
+        First month of the season (1-12).  Default ``6`` (June).
+    season_length : int, optional
+        Number of months in the season (1-12).  Default ``4`` (JJAS).
 
     Returns
     -------
@@ -157,6 +167,14 @@ def get_annual_stats(events_df, year_col='year', ensemble_col=None,
     duration_col = _resolve_case_col(events_df, duration_col)
     if length_col is not None and length_col not in events_df.columns:
         raise KeyError(f"length_col {length_col!r} not in events_df")
+
+    # ---- optional season filter ----------------------------------------
+    if months_col is not None:
+        from threshold_detector.detector import season_months
+        if months_col not in events_df.columns:
+            raise KeyError(f"months_col {months_col!r} not in events_df")
+        in_season = set(season_months(season_start, season_length))
+        events_df = events_df[events_df[months_col].isin(in_season)]
 
     if years is None:
         years = sorted(events_df[year_col].unique())
@@ -214,7 +232,9 @@ def get_annual_stats(events_df, year_col='year', ensemble_col=None,
 def get_annual_stats_by_variable(events_by_variable, year_col='year',
                                  ensemble_col=None,
                                  duration_col='n_extreme_cases',
-                                 length_col='length', years=None):
+                                 length_col='length', years=None,
+                                 months_col=None, season_start=1,
+                                 season_length=12):
     """
     calc annual statistics for each individual input variable separately
 
@@ -231,6 +251,9 @@ def get_annual_stats_by_variable(events_by_variable, year_col='year',
         on that variable alone, with ``year_col`` (and optionally
         ``ensemble_col``) already attached.
     year_col, ensemble_col, duration_col, length_col, years
+        Forwarded to :func:`get_annual_stats` unchanged — see its docstring
+        for details.
+    months_col, season_start, season_length
         Forwarded to :func:`get_annual_stats` unchanged — see its docstring
         for details.
 
@@ -256,6 +279,9 @@ def get_annual_stats_by_variable(events_by_variable, year_col='year',
             duration_col=duration_col,
             length_col=length_col,
             years=years,
+            months_col=months_col,
+            season_start=season_start,
+            season_length=season_length,
         )
         part.insert(0, 'variable', name)
         pieces.append(part)
