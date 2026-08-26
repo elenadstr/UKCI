@@ -265,7 +265,8 @@ def get_annual_stats_by_variable(events_by_variable, year_col='year',
 
 
 def get_flag_annual_stats(binary, years, min_duration=1,
-                          ensemble=None, year_range=None):
+                          ensemble=None, year_range=None,
+                          months=None, season_start=6, season_length=4):
     """
     Annual stats directly from a binary flag series
     (output of :func:`~threshold_detector.detector.flag_extreme_events`),
@@ -293,8 +294,20 @@ before any cross-variable compounding or ECA linkage.
         ``pd.concat``.
     year_range : (int, int), optional
         Inclusive ``(start_year, end_year)``.  Years outside this range
-        appear as zero rows; years in the range but absent in *binary*
+        appear as zero rows; years in the range but absent in inary
         also appear as zero rows.  Default: the years present in *years*.
+    months : array-like of int, optional
+        Month label (1-12) for every timestep, same length as binary.
+        If inputed, spells are detected within season blocks so they
+        cannot cross a season boundary, and year labels use the season-start
+        year (matching :func:`~threshold_detector.detector.season_year_labels`
+        — relevant for wrapping seasons such as Oct-Feb).  Required when the
+        season wraps the calendar year; ignored when ``None`` (assumes the
+        series is already season-extracted and contiguous).
+    season_start : int, optional
+        First month of the season (1-12).  Default ``6`` (June).
+    season_length : int, optional
+        Number of months in the season (1-12).  Default ``4`` (JJAS).
 
     Returns
     -------
@@ -315,6 +328,9 @@ before any cross-variable compounding or ECA linkage.
         flagged); both columns are returned for consistency with
         :func:`get_annual_stats`.
     """
+    from threshold_detector.detector import (make_season_blocks,
+                                              season_year_labels)
+
     binary = np.asarray(binary, dtype=int)
     years  = np.asarray(years,  dtype=int)
     if binary.ndim != 1:
@@ -322,31 +338,61 @@ before any cross-variable compounding or ECA linkage.
     if len(binary) != len(years):
         raise ValueError("binary and years must be the same length")
 
+    # ---- season setup --------------------------------------------------
+    if months is not None:
+        months_arr = np.asarray(months, dtype=int)
+        if len(months_arr) != len(binary):
+            raise ValueError("months must be the same length as binary")
+        blocks = make_season_blocks(years, months_arr, season_start,
+                                    season_length)
+        label_years = season_year_labels(years, months_arr, season_start)
+    else:
+        blocks = None
+        label_years = years
+
     # ---- find maximal runs of consecutive 1s ----------------------------
     spells = []  # list of (start_idx, end_idx)
-    i = 0
-    n = len(binary)
-    while i < n:
-        if binary[i] == 1:
-            j = i
-            while j < n and binary[j] == 1:
-                j += 1
-            spells.append((i, j - 1))
-            i = j
-        else:
-            i += 1
+    if blocks is not None:
+        for blk in blocks:
+            b = binary[blk]
+            n_blk = len(blk)
+            i = 0
+            while i < n_blk:
+                if b[i] == 1:
+                    j = i
+                    while j < n_blk and b[j] == 1:
+                        j += 1
+                    spells.append((int(blk[i]), int(blk[j - 1])))
+                    i = j
+                else:
+                    i += 1
+    else:
+        i = 0
+        n = len(binary)
+        while i < n:
+            if binary[i] == 1:
+                j = i
+                while j < n and binary[j] == 1:
+                    j += 1
+                spells.append((i, j - 1))
+                i = j
+            else:
+                i += 1
 
     # ---- filter and tag with year ---------------------------------------
     spell_years, lengths = [], []
     for start, end in spells:
         ln = end - start + 1
         if ln >= min_duration:
-            spell_years.append(int(years[start]))
+            spell_years.append(int(label_years[start]))
             lengths.append(ln)
 
     # ---- build full year grid ------------------------------------------
     if year_range is not None:
         all_years = list(range(int(year_range[0]), int(year_range[1]) + 1))
+    elif blocks is not None:
+        season_idx = np.concatenate(blocks) if blocks else np.empty(0, dtype=int)
+        all_years = sorted(set(map(int, label_years[season_idx])))
     else:
         all_years = sorted(set(map(int, years)))
 
