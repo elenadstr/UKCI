@@ -266,7 +266,7 @@ def get_annual_stats_by_variable(events_by_variable, year_col='year',
 
 def get_flag_annual_stats(binary, years, min_duration=1,
                           ensemble=None, year_range=None,
-                          months=None, season_start=6, season_length=4):
+                          months=None, season_start=1, season_length=12):
     """
     Annual stats directly from a binary flag series
     (output of :func:`~threshold_detector.detector.flag_extreme_events`),
